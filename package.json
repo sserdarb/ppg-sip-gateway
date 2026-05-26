@@ -1,0 +1,15 @@
+{
+  "name": "ppg-sip-gateway",
+  "version": "1.0.0",
+  "description": "SIP-over-WebSocket to SIP-UDP gateway for PBX systems without native WSS support",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
