@@ -110,7 +110,11 @@ class SipSession {
   // ─────────────────────────────────────────────────────────────────────────
   onClientMessage(data) {
     const sip = data.toString('utf8')
-    if (LOG_SIP) console.log(`[${this.id} →PBX] ${sip.split('\r\n')[0]}`)
+    if (LOG_SIP) {
+      console.log(`[${this.id} →PBX] ─── client message (${Buffer.byteLength(sip)} bytes) ───`)
+      console.log(sip.replace(/\r\n/g, '\n'))
+      console.log(`[${this.id} →PBX] ─── end ───`)
+    }
 
     const ourVia = `Via: SIP/2.0/UDP ${GATEWAY_HOST}:${this.localUdpPort};branch=${this.ourBranchPrefix}${crypto.randomBytes(4).toString('hex')};rport`
 
@@ -144,6 +148,12 @@ class SipSession {
     // 3) Recompute Content-Length to be safe (CRLF body separation)
     rewritten = recomputeContentLength(rewritten)
 
+    if (LOG_SIP) {
+      console.log(`[${this.id} →PBX rewritten ${Buffer.byteLength(rewritten)} bytes]:`)
+      console.log(rewritten.replace(/\r\n/g, '\n'))
+      console.log(`[${this.id} →PBX] sending to ${PBX_HOST}:${PBX_PORT} from local port ${this.localUdpPort}`)
+    }
+
     totalToPbx++
     this.udp.send(rewritten, PBX_PORT, PBX_HOST, (err) => {
       if (err) console.error(`[${this.id}] UDP send failed:`, err.message)
@@ -157,7 +167,11 @@ class SipSession {
   // ─────────────────────────────────────────────────────────────────────────
   onPbxMessage(msg) {
     let sip = msg.toString('utf8')
-    if (LOG_SIP) console.log(`[${this.id} ←PBX] ${sip.split('\r\n')[0]}`)
+    if (LOG_SIP) {
+      console.log(`[${this.id} ←PBX] ─── pbx message (${msg.length} bytes) ───`)
+      console.log(sip.replace(/\r\n/g, '\n'))
+      console.log(`[${this.id} ←PBX] ─── end ───`)
+    }
 
     // Remove ONLY our Via (identified by our branch prefix)
     sip = sip.replace(
