@@ -8,6 +8,7 @@ const http = require('http')
 const dgram = require('dgram')
 const crypto = require('crypto')
 const { WebSocketServer } = require('ws')
+const { RtpEngineClient } = require('./rtpengine-client')
 
 const PORT          = parseInt(process.env.PORT || '8080', 10)
 const UDP_PORT      = parseInt(process.env.UDP_PORT || '5070', 10)
@@ -15,6 +16,19 @@ const PBX_HOST      = process.env.PBX_HOST || '90.158.44.140'
 const PBX_PORT      = parseInt(process.env.PBX_PORT || '5060', 10)
 const GATEWAY_HOST  = process.env.GATEWAY_HOST || '76.13.0.113'
 const LOG_SIP       = process.env.LOG_SIP === '1'
+const RTPENGINE_HOST = process.env.RTPENGINE_HOST || ''   // empty = disabled
+const RTPENGINE_PORT = parseInt(process.env.RTPENGINE_PORT || '22222', 10)
+
+// ── rtpengine client (optional — only used when host is configured) ─────────
+const rtpengine = RTPENGINE_HOST
+  ? new RtpEngineClient(RTPENGINE_HOST, RTPENGINE_PORT)
+  : null
+
+if (rtpengine) {
+  rtpengine.ping()
+    .then(r => console.log('[rtpengine] ping OK:', JSON.stringify(r)))
+    .catch(e => console.error('[rtpengine] ping FAILED:', e.message))
+}
 
 // ── Shared UDP socket to/from PBX ───────────────────────────────────────────
 const udp = dgram.createSocket('udp4')
@@ -108,6 +122,8 @@ class SipSession {
     this.callIds = new Set()
     this.closed = false
     this.clientTopVia = null  // remember client's top Via so we can restore it on responses
+    this.lastOfferCallId = null
+    this.lastOfferFromTag = null
 
     totalSessions++
     activeSessions++
@@ -128,11 +144,16 @@ class SipSession {
     // Clean up our branch entries
     for (const b of this.branches) branchToSession.delete(b)
     for (const c of this.callIds) callIdToSession.delete(c)
+    // Tear down rtpengine session if any
+    if (rtpengine && this.lastOfferCallId) {
+      rtpengine.delete({ callId: this.lastOfferCallId, fromTag: this.lastOfferFromTag })
+        .catch(() => {})
+    }
     try { this.ws.close() } catch {}
     console.log(`[${this.id}] closed (active=${activeSessions})`)
   }
 
-  onClientMessage(data) {
+  async onClientMessage(data) {
     const sip = data.toString('utf8')
     if (LOG_SIP) {
       console.log(`[${this.id} ←WS] ─── ${Buffer.byteLength(sip)} bytes ───`)
@@ -179,7 +200,42 @@ class SipSession {
       callIdToSession.set(cid, this)
     }
 
-    // 4) Recompute Content-Length
+    // 4) If this message carries SDP and rtpengine is configured,
+    //    pass it through rtpengine offer/answer to bridge WebRTC ↔ PBX media.
+    if (rtpengine) {
+      const { headers, body } = splitSipMessage(rewritten)
+      if (body && /Content-Type:\s*application\/sdp/i.test(headers)) {
+        const callId = extractHeader(headers, 'Call-ID')
+        const fromTag = extractTag(extractHeader(headers, 'From'))
+        const toTag = extractTag(extractHeader(headers, 'To'))
+        const firstLine = headers.split('\r\n')[0]
+        const isRequest = !/^SIP\/2\.0/i.test(firstLine)
+        const isResponse = /^SIP\/2\.0\s+\d+/i.test(firstLine)
+
+        try {
+          let result
+          if (isRequest) {
+            // Client → PBX with SDP → "offer"
+            result = await rtpengine.offer({ callId, fromTag, sdp: body })
+            this.lastOfferCallId = callId
+            this.lastOfferFromTag = fromTag
+          } else if (isResponse && toTag) {
+            // Client sending response with SDP (rare on outbound) → "answer"
+            result = await rtpengine.answer({ callId, fromTag, toTag, sdp: body })
+          }
+          if (result?.sdp) {
+            rewritten = headers + '\r\n\r\n' + result.sdp
+            if (LOG_SIP) console.log(`[${this.id}] SDP rewritten via rtpengine (${result.result || 'ok'})`)
+          } else if (result?.['error-reason']) {
+            console.warn(`[${this.id}] rtpengine error: ${result['error-reason']}`)
+          }
+        } catch (e) {
+          console.error(`[${this.id}] rtpengine offer/answer failed:`, e.message)
+        }
+      }
+    }
+
+    // 5) Recompute Content-Length after any body changes
     rewritten = recomputeContentLength(rewritten)
 
     if (LOG_SIP) {
@@ -193,18 +249,46 @@ class SipSession {
     })
   }
 
-  onPbxMessage(sip) {
+  async onPbxMessage(sip) {
     // Replace our Via with the client's original top Via, so JsSIP recognises
     // the response (it matches by branch in its own Via).
     let stripped = sip
     if (this.clientTopVia) {
-      // Replace the FIRST Via line entirely with the client's via
       stripped = stripped.replace(/^Via:[^\r\n]*\r\n/im, `Via: ${this.clientTopVia}\r\n`)
     } else {
-      // Fall back: strip our Via (with our branch prefix)
       for (const b of this.branches) {
         const re = new RegExp(`^Via:[^\\r\\n]*${b}[^\\r\\n]*\\r\\n`, 'im')
         stripped = stripped.replace(re, '')
+      }
+    }
+
+    // If the PBX response carries SDP, run it through rtpengine "answer" so
+    // the WebRTC side gets DTLS-SRTP back instead of the PBX's plain RTP.
+    if (rtpengine) {
+      const { headers, body } = splitSipMessage(stripped)
+      if (body && /Content-Type:\s*application\/sdp/i.test(headers)) {
+        const callId = extractHeader(headers, 'Call-ID')
+        const fromTag = extractTag(extractHeader(headers, 'From'))
+        const toTag = extractTag(extractHeader(headers, 'To'))
+        try {
+          const r = await rtpengine.answer({ callId, fromTag, toTag, sdp: body })
+          if (r?.sdp) {
+            stripped = headers + '\r\n\r\n' + r.sdp
+            stripped = recomputeContentLength(stripped)
+            if (LOG_SIP) console.log(`[${this.id}] PBX SDP rewritten via rtpengine`)
+          } else if (r?.['error-reason']) {
+            console.warn(`[${this.id}] rtpengine answer error: ${r['error-reason']}`)
+          }
+        } catch (e) {
+          console.error(`[${this.id}] rtpengine answer failed:`, e.message)
+        }
+      }
+
+      // Clean up rtpengine session on BYE/CANCEL
+      const firstLine = stripped.split('\r\n')[0]
+      if (/^(BYE|CANCEL)\s/i.test(firstLine) && this.lastOfferCallId) {
+        rtpengine.delete({ callId: this.lastOfferCallId, fromTag: this.lastOfferFromTag })
+          .catch(() => {})
       }
     }
 
@@ -219,6 +303,25 @@ class SipSession {
       catch (err) { console.error(`[${this.id}] WS send failed:`, err.message) }
     }
   }
+}
+
+// ── SIP utility helpers ─────────────────────────────────────────────────────
+function splitSipMessage(sip) {
+  const sep = sip.indexOf('\r\n\r\n')
+  if (sep === -1) return { headers: sip, body: '' }
+  return { headers: sip.slice(0, sep), body: sip.slice(sep + 4) }
+}
+
+function extractHeader(headers, name) {
+  const re = new RegExp(`^${name}:\\s*([^\\r\\n]+)`, 'im')
+  const m = headers.match(re)
+  return m ? m[1].trim() : ''
+}
+
+function extractTag(headerValue) {
+  if (!headerValue) return ''
+  const m = headerValue.match(/;tag=([^;\s]+)/i)
+  return m ? m[1] : ''
 }
 
 function recomputeContentLength(sip) {
