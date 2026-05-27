@@ -107,6 +107,7 @@ class SipSession {
     this.branches = new Set()
     this.callIds = new Set()
     this.closed = false
+    this.clientTopVia = null  // remember client's top Via so we can restore it on responses
 
     totalSessions++
     activeSessions++
@@ -146,17 +147,18 @@ class SipSession {
 
     const ourVia = `Via: SIP/2.0/UDP ${GATEWAY_HOST}:${UDP_PORT};branch=${ourBranch};rport`
 
-    let rewritten = sip
+    // B2BUA-style: REPLACE all client Vias with our single Via (and remember
+    // the client's top Via so we can put it back on responses). Many SIP
+    // servers (Sippy, Kamailio) silently drop messages with .invalid hosts
+    // in the Via chain, which JsSIP always uses for WSS.
+    const clientViaMatch = sip.match(/^Via:\s*([^\r\n]+)/im)
+    this.clientTopVia = clientViaMatch ? clientViaMatch[1] : null
 
-    // 1) Insert our Via at the top
-    const viaPos = rewritten.search(/^Via:/im)
-    if (viaPos !== -1) {
-      rewritten = rewritten.slice(0, viaPos) + ourVia + '\r\n' + rewritten.slice(viaPos)
-    } else {
-      const firstLineEnd = rewritten.indexOf('\r\n')
-      if (firstLineEnd !== -1) {
-        rewritten = rewritten.slice(0, firstLineEnd + 2) + ourVia + '\r\n' + rewritten.slice(firstLineEnd + 2)
-      }
+    // Strip ALL Via headers from the client message, then prepend ours
+    let rewritten = sip.replace(/^Via:[^\r\n]*\r\n/gim, '')
+    const firstLineEnd = rewritten.indexOf('\r\n')
+    if (firstLineEnd !== -1) {
+      rewritten = rewritten.slice(0, firstLineEnd + 2) + ourVia + '\r\n' + rewritten.slice(firstLineEnd + 2)
     }
 
     // 2) Rewrite Contact — pointing to our gateway's UDP listener
@@ -192,11 +194,18 @@ class SipSession {
   }
 
   onPbxMessage(sip) {
-    // Strip our top Via (the one with our branch)
+    // Replace our Via with the client's original top Via, so JsSIP recognises
+    // the response (it matches by branch in its own Via).
     let stripped = sip
-    for (const b of this.branches) {
-      const re = new RegExp(`^Via:[^\\r\\n]*${b}[^\\r\\n]*\\r\\n`, 'im')
-      stripped = stripped.replace(re, '')
+    if (this.clientTopVia) {
+      // Replace the FIRST Via line entirely with the client's via
+      stripped = stripped.replace(/^Via:[^\r\n]*\r\n/im, `Via: ${this.clientTopVia}\r\n`)
+    } else {
+      // Fall back: strip our Via (with our branch prefix)
+      for (const b of this.branches) {
+        const re = new RegExp(`^Via:[^\\r\\n]*${b}[^\\r\\n]*\\r\\n`, 'im')
+        stripped = stripped.replace(re, '')
+      }
     }
 
     if (LOG_SIP) {
