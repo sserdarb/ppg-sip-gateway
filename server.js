@@ -30,6 +30,11 @@ if (rtpengine) {
     .catch(e => console.error('[rtpengine] ping FAILED:', e.message))
 }
 
+// ── AI voice concierge: answers calls to AI_EXT locally (no PBX forward) ─────
+const { AiCall, AI_EXT, AI_RTP_PORT, PUBLIC_IP: AI_PUBLIC } = require('./ai-agent')
+const aiDialogs = new Map()  // Call-ID → AiCall (active AI calls)
+console.log(`[ai] voice concierge enabled for extension ${AI_EXT} (rtp ${AI_PUBLIC}:${AI_RTP_PORT})`)
+
 // ── Shared UDP socket to/from PBX ───────────────────────────────────────────
 const udp = dgram.createSocket('udp4')
 
@@ -160,6 +165,9 @@ class SipSession {
       console.log(sip.replace(/\r\n/g, '\n'))
       console.log(`[${this.id} ←WS] ─── end ───`)
     }
+
+    // ── AI extension intercept: answer locally, never forward to PBX ─────────
+    if (rtpengine && this.handleIfAi(sip)) return
 
     // Generate our own branch for this hop; lets us route responses
     const ourBranch = `z9hG4bK-gw-${this.id}-${crypto.randomBytes(4).toString('hex')}`
@@ -302,6 +310,93 @@ class SipSession {
       try { this.ws.send(stripped) }
       catch (err) { console.error(`[${this.id}] WS send failed:`, err.message) }
     }
+  }
+
+  // ── AI extension handling ────────────────────────────────────────────────
+  // Returns true if this message belongs to the AI extension (handled locally).
+  handleIfAi(sip) {
+    const firstLine = sip.split('\r\n')[0]
+    const reqM = firstLine.match(/^([A-Z]+)\s+sips?:([^@\s;>]+)(?:@|\s)/i)
+    const method = reqM ? reqM[1].toUpperCase() : null
+    const callId = (sip.match(/^Call-ID:\s*([^\r\n]+)/im)?.[1] || '').trim()
+
+    // In-dialog requests for an active AI call (ACK / BYE / CANCEL)
+    if (callId && aiDialogs.has(callId)) {
+      if (method === 'BYE' || method === 'CANCEL') {
+        this.sendToClient(this.buildResponse(sip, 200, 'OK'))
+        const call = aiDialogs.get(callId); aiDialogs.delete(callId)
+        try { call.close() } catch {}
+        rtpengine.delete({ callId, fromTag: extractTag(extractHeader(sip, 'From')) }).catch(() => {})
+        console.log(`[ai] call ${callId} ended (${method})`)
+      }
+      return true  // ACK absorbed; any other in-dialog msg swallowed
+    }
+
+    // New INVITE to the AI extension → answer with the voice concierge
+    if (method === 'INVITE' && reqM[2] === AI_EXT) {
+      this.handleAiInvite(sip, callId).catch(e => console.error('[ai] invite error:', e.message))
+      return true
+    }
+    return false
+  }
+
+  async handleAiInvite(sip, callId) {
+    const { body } = splitSipMessage(sip)
+    const fromTag = extractTag(extractHeader(sip, 'From'))
+    if (!body) { this.sendToClient(this.buildResponse(sip, 488, 'Not Acceptable Here')); return }
+
+    // 1) Feed the browser's WebRTC offer to rtpengine → plain-PCMU "callee" SDP.
+    let offerRes = null
+    try { offerRes = await rtpengine.offer({ callId, fromTag, sdp: body }) } catch (e) { console.error('[ai] rtpengine offer:', e.message) }
+    const calleeSdp = offerRes?.sdp || ''
+    const rIp = (calleeSdp.match(/^c=IN IP4 (\S+)/m) || [])[1]
+    const rPort = parseInt((calleeSdp.match(/^m=audio (\d+)/m) || [])[1] || '0', 10)
+    if (!rIp || !rPort) { console.error('[ai] no rtpengine media addr'); this.sendToClient(this.buildResponse(sip, 500, 'Server Internal Error')); return }
+
+    // 2) Our AI media (PCMU @ our published RTP port) → rtpengine.answer → browser SDP.
+    const toTag = crypto.randomBytes(6).toString('hex')
+    const aiSdp = [
+      'v=0', `o=ai 0 0 IN IP4 ${AI_PUBLIC}`, 's=ppg-ai', `c=IN IP4 ${AI_PUBLIC}`, 't=0 0',
+      `m=audio ${AI_RTP_PORT} RTP/AVP 0 101`, 'a=rtpmap:0 PCMU/8000',
+      'a=rtpmap:101 telephone-event/8000', 'a=fmtp:101 0-16', 'a=ptime:20', 'a=sendrecv', '',
+    ].join('\r\n')
+    let ansRes = null
+    try { ansRes = await rtpengine.answer({ callId, fromTag, toTag, sdp: aiSdp }) } catch (e) { console.error('[ai] rtpengine answer:', e.message) }
+    const browserSdp = ansRes?.sdp
+    if (!browserSdp) { console.error('[ai] rtpengine answer failed'); this.sendToClient(this.buildResponse(sip, 500, 'Server Internal Error')); return }
+
+    // 3) 200 OK with the WebRTC answer.
+    this.sendToClient(this.buildResponse(sip, 200, 'OK', {
+      toTag,
+      extra: [`Contact: <sip:${AI_EXT}@${GATEWAY_HOST}:${UDP_PORT};transport=udp>`, 'Content-Type: application/sdp'],
+      body: browserSdp,
+    }))
+
+    // 4) Start the voice agent (PCMU RTP via rtpengine ↔ Whisper/NVIDIA/Google-TTS).
+    const call = new AiCall({ remoteIp: rIp, remotePort: rPort })
+    aiDialogs.set(callId, call)
+    this.callIds.add(callId)
+    console.log(`[ai] answered ${AI_EXT} (call ${callId}) → media to ${rIp}:${rPort}`)
+  }
+
+  sendToClient(msg) {
+    if (this.ws.readyState === 1) { try { this.ws.send(msg) } catch (e) { console.error('[ai] ws send:', e.message) } }
+  }
+
+  // Build a SIP response from a request: copy Via/From/Call-ID/CSeq verbatim,
+  // add a tag to To, append extra headers + body.
+  buildResponse(reqSip, code, reason, opts = {}) {
+    const { headers } = splitSipMessage(reqSip)
+    const lines = headers.split('\r\n')
+    const out = [`SIP/2.0 ${code} ${reason}`]
+    for (const ln of lines.slice(1)) {
+      if (/^(Via|From|Call-ID|CSeq):/i.test(ln)) out.push(ln)
+      else if (/^To:/i.test(ln)) out.push(opts.toTag && !/;tag=/i.test(ln) ? `${ln};tag=${opts.toTag}` : ln)
+    }
+    for (const e of (opts.extra || [])) out.push(e)
+    const body = opts.body || ''
+    out.push(`Content-Length: ${Buffer.byteLength(body)}`)
+    return out.join('\r\n') + '\r\n\r\n' + body
   }
 }
 
