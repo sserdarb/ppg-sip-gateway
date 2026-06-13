@@ -18,6 +18,8 @@ const GATEWAY_HOST  = process.env.GATEWAY_HOST || '76.13.0.113'
 const LOG_SIP       = process.env.LOG_SIP === '1'
 const RTPENGINE_HOST = process.env.RTPENGINE_HOST || ''   // empty = disabled
 const RTPENGINE_PORT = parseInt(process.env.RTPENGINE_PORT || '22222', 10)
+const PPG_API_URL    = (process.env.PPG_API_URL || 'https://ppg.pmapartner.com').replace(/\/$/, '')
+const GATEWAY_SECRET = process.env.GATEWAY_SECRET || ''
 
 // ── rtpengine client (optional — only used when host is configured) ─────────
 const rtpengine = RTPENGINE_HOST
@@ -45,6 +47,10 @@ const branchToSession = new Map()
 
 // Also map Call-ID → session, for in-dialog requests from PBX
 const callIdToSession = new Map()
+
+// Inbound AI calls answered by this gateway (no WS session involved)
+// callId → { call: AiCall, fromAddr: {address,port}, toTag, fromTag }
+const inboundAiDialogs = new Map()
 
 let totalSessions = 0
 let activeSessions = 0
@@ -76,6 +82,17 @@ udp.on('message', (msg, rinfo) => {
   }
 
   if (!session) {
+    // ── inbound AI dialog (ACK / BYE for calls we answered) ───────────────
+    const cidAi = (sip.match(/^Call-ID:\s*([^\r\n]+)/im)?.[1] || '').trim()
+    if (cidAi && inboundAiDialogs.has(cidAi)) {
+      handleInboundAiDialog(sip, rinfo, cidAi)
+      return
+    }
+    // ── new inbound INVITE from PBX ───────────────────────────────────────
+    if (/^INVITE\s/i.test(sip.split('\r\n')[0])) {
+      handleInboundInvite(sip, rinfo).catch(e => console.error('[inbound]', e.message))
+      return
+    }
     console.warn(`[udp ←] no session match — dropping`)
     return
   }
@@ -398,6 +415,169 @@ class SipSession {
     out.push(`Content-Length: ${Buffer.byteLength(body)}`)
     return out.join('\r\n') + '\r\n\r\n' + body
   }
+}
+
+// ── Inbound call handling (PBX → gateway, no WS session) ───────────────────
+
+// Build a SIP response from a request (standalone, mirrors SipSession.buildResponse)
+function buildUdpResponse(reqSip, code, reason, opts = {}) {
+  const { headers } = splitSipMessage(reqSip)
+  const lines = headers.split('\r\n')
+  const out = [`SIP/2.0 ${code} ${reason}`]
+  for (const ln of lines.slice(1)) {
+    if (/^(Via|From|Call-ID|CSeq):/i.test(ln)) out.push(ln)
+    else if (/^To:/i.test(ln)) {
+      out.push(opts.toTag && !/;tag=/i.test(ln) ? `${ln};tag=${opts.toTag}` : ln)
+    }
+  }
+  for (const e of (opts.extra || [])) out.push(e)
+  const body = opts.body || ''
+  out.push(`Content-Length: ${Buffer.byteLength(body)}`)
+  return out.join('\r\n') + '\r\n\r\n' + body
+}
+
+async function handleInboundInvite(sip, rinfo) {
+  const reqLine = sip.split('\r\n')[0]
+  // Extract DID: INVITE sip:908502523434@161.97.132.250:5070 SIP/2.0
+  const didMatch = reqLine.match(/^INVITE\s+sips?:(\+?[\d]+)(?:@|\s)/i)
+  const did = didMatch ? didMatch[1] : null
+  const callId = (sip.match(/^Call-ID:\s*([^\r\n]+)/im)?.[1] || '').trim()
+  const fromTag = extractTag(extractHeader(sip, 'From'))
+
+  console.log(`[inbound] INVITE did=${did} call=${callId} from=${rinfo.address}:${rinfo.port}`)
+
+  // 100 Trying
+  udp.send(Buffer.from(buildUdpResponse(sip, 100, 'Trying')), rinfo.port, rinfo.address)
+
+  if (!did || !callId) {
+    udp.send(Buffer.from(buildUdpResponse(sip, 404, 'Not Found')), rinfo.port, rinfo.address)
+    return
+  }
+
+  // PPG DID lookup
+  let routeInfo = null
+  try {
+    const url = `${PPG_API_URL}/api/cc/route?did=${encodeURIComponent(did)}`
+    const fetchHeaders = GATEWAY_SECRET ? { 'x-gateway-secret': GATEWAY_SECRET } : {}
+    const r = await fetch(url, { headers: fetchHeaders, signal: AbortSignal.timeout(6000) })
+    routeInfo = await r.json()
+  } catch (e) {
+    console.error('[inbound] PPG lookup failed:', e.message)
+    udp.send(Buffer.from(buildUdpResponse(sip, 503, 'Service Unavailable')), rinfo.port, rinfo.address)
+    return
+  }
+
+  if (!routeInfo?.found) {
+    console.log(`[inbound] DID ${did} not configured in PPG`)
+    udp.send(Buffer.from(buildUdpResponse(sip, 404, 'Not Found')), rinfo.port, rinfo.address)
+    return
+  }
+
+  const route  = routeInfo.resolved?.route
+  const trunk  = routeInfo.trunk
+  const reason = routeInfo.resolved?.routeReason
+
+  if (!route) {
+    udp.send(Buffer.from(buildUdpResponse(sip, 503, 'No Route Configured')), rinfo.port, rinfo.address)
+    return
+  }
+
+  console.log(`[inbound] DID ${did} → route=${route.kind} reason=${reason}`)
+
+  if (route.kind === 'ai') {
+    await handleInboundAi(sip, rinfo, callId, fromTag, trunk)
+  } else if (route.kind === 'external' && route.externalNumber) {
+    // Forward to external number via PBX re-INVITE (future)
+    console.log(`[inbound] external forward to ${route.externalNumber} — not yet implemented`)
+    udp.send(Buffer.from(buildUdpResponse(sip, 503, 'Not Implemented')), rinfo.port, rinfo.address)
+  } else {
+    // queue/agent/ivr/voicemail: ring connected WS softphone
+    await handleInboundSoftphone(sip, rinfo, callId, fromTag, trunk, route)
+  }
+}
+
+async function handleInboundAi(sip, rinfo, callId, fromTag, trunk) {
+  const { body } = splitSipMessage(sip)
+  if (!body) {
+    udp.send(Buffer.from(buildUdpResponse(sip, 488, 'Not Acceptable Here')), rinfo.port, rinfo.address)
+    return
+  }
+
+  // Parse PBX SDP to find where they'll send media
+  const pbxIp   = (body.match(/^c=IN IP4 (\S+)/m) || [])[1]
+  const pbxPort = parseInt((body.match(/^m=audio (\d+)/m) || [])[1] || '0', 10)
+  if (!pbxIp || !pbxPort) {
+    console.error('[inbound:ai] no media address in PBX SDP')
+    udp.send(Buffer.from(buildUdpResponse(sip, 488, 'Not Acceptable Here')), rinfo.port, rinfo.address)
+    return
+  }
+
+  const toTag = crypto.randomBytes(6).toString('hex')
+
+  // Our AI SDP: AI listens on AI_RTP_PORT, PBX sends PCMU there
+  const aiSdp = [
+    'v=0',
+    `o=ai 0 0 IN IP4 ${AI_PUBLIC}`,
+    's=ppg-ai',
+    `c=IN IP4 ${AI_PUBLIC}`,
+    't=0 0',
+    `m=audio ${AI_RTP_PORT} RTP/AVP 0`,
+    'a=rtpmap:0 PCMU/8000',
+    'a=ptime:20',
+    'a=sendrecv',
+    '',
+  ].join('\r\n')
+
+  const ok200 = buildUdpResponse(sip, 200, 'OK', {
+    toTag,
+    extra: [
+      `Contact: <sip:ai@${GATEWAY_HOST}:${UDP_PORT};transport=udp>`,
+      'Content-Type: application/sdp',
+    ],
+    body: aiSdp,
+  })
+  udp.send(Buffer.from(ok200), rinfo.port, rinfo.address)
+
+  const greetingOverride = trunk?.greetingText || undefined
+  const call = new AiCall({ remoteIp: pbxIp, remotePort: pbxPort, greetingOverride })
+  inboundAiDialogs.set(callId, { call, fromAddr: rinfo, toTag, fromTag })
+  console.log(`[inbound:ai] answered ${callId} — PBX ${pbxIp}:${pbxPort} ↔ AI :${AI_RTP_PORT}`)
+}
+
+function handleInboundAiDialog(sip, rinfo, callId) {
+  const dialog = inboundAiDialogs.get(callId)
+  const firstLine = sip.split('\r\n')[0]
+  if (/^ACK\s/i.test(firstLine)) return  // absorb silently
+  if (/^BYE\s/i.test(firstLine)) {
+    udp.send(Buffer.from(buildUdpResponse(sip, 200, 'OK')), rinfo.port, rinfo.address)
+    if (dialog?.call) { try { dialog.call.close() } catch {} }
+    inboundAiDialogs.delete(callId)
+    console.log(`[inbound:ai] call ${callId} ended (BYE)`)
+    return
+  }
+  if (/^CANCEL\s/i.test(firstLine)) {
+    udp.send(Buffer.from(buildUdpResponse(sip, 200, 'OK')), rinfo.port, rinfo.address)
+    if (dialog?.call) { try { dialog.call.close() } catch {} }
+    inboundAiDialogs.delete(callId)
+    console.log(`[inbound:ai] call ${callId} cancelled`)
+  }
+}
+
+async function handleInboundSoftphone(sip, rinfo, callId, fromTag, trunk, route) {
+  // Find a connected WebSocket agent to ring.
+  // For now: ring first connected WS client; full queue/priority routing is Phase 2.
+  const openClients = [...wss.clients].filter(ws => ws.readyState === 1 /* OPEN */)
+  if (openClients.length === 0) {
+    console.log(`[inbound:softphone] no agents online for ${callId} (DID ${trunk?.number})`)
+    udp.send(Buffer.from(buildUdpResponse(sip, 480, 'Temporarily Unavailable')), rinfo.port, rinfo.address)
+    return
+  }
+
+  // TODO: Phase 2 — re-INVITE PBX SDP via rtpengine, forward to WS softphone,
+  // bridge responses back. For now send 480 to inform PBX no agent answered.
+  // Agent can see the call on the wallboard and call back via the softphone.
+  console.log(`[inbound:softphone] ${openClients.length} agent(s) online but WS-ring not yet implemented for ${callId}`)
+  udp.send(Buffer.from(buildUdpResponse(sip, 480, 'Temporarily Unavailable')), rinfo.port, rinfo.address)
 }
 
 // ── SIP utility helpers ─────────────────────────────────────────────────────

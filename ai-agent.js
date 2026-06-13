@@ -112,10 +112,11 @@ async function ttsUlaw(text) {
 
 // ── one live AI call ─────────────────────────────────────────────────────────
 class AiCall {
-  constructor({ remoteIp, remotePort, onBye }) {
+  constructor({ remoteIp, remotePort, onBye, greetingOverride } = {}) {
     this.remoteIp = remoteIp        // rtpengine AI-side addr (where we send RTP)
     this.remotePort = remotePort
     this.onBye = onBye
+    this._greeting = greetingOverride || GREETING
     this.seq = (Math.random() * 0xffff) | 0
     this.ts = (Math.random() * 0xffffffff) >>> 0
     this.ssrc = (Math.random() * 0xffffffff) >>> 0
@@ -137,7 +138,7 @@ class AiCall {
     // 20ms playout pacer
     this.pacer = setInterval(() => this.tick(), 20)
     // greet shortly after answer
-    setTimeout(() => this.say(GREETING), 700)
+    setTimeout(() => this.say(this._greeting), 700)
   }
 
   onRtp(msg) {
