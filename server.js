@@ -545,6 +545,7 @@ async function handleInboundAi(sip, rinfo, callId, fromTag, trunk, aiCfg) {
     agentName:             aiCfg?.agentName      || undefined,
     voiceProfiles:         aiCfg?.voiceProfiles  || undefined,
     defaultVoiceProfileId: aiCfg?.defaultVoiceProfileId || undefined,
+    priceContext:          aiCfg?.priceContext   || undefined,
   })
   inboundAiDialogs.set(callId, { call, fromAddr: rinfo, toTag, fromTag })
   const profileId = call.currentProfile?.id || '?'

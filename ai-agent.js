@@ -25,19 +25,27 @@ const HOTEL       = process.env.AI_HOTEL_NAME || 'otelimiz'
 const LOG = (...a) => console.log('[ai]', ...a)
 
 // ── built-in voice profiles (overridable via constructor) ────────────────────
+// Voice genders VERIFIED live against Google TTS voices.list (2026-06-14).
+// CRITICAL: tr-TR-Wavenet-E is MALE — it was wrongly used for the "Ayşe" female
+// profile, so callers heard a male voice. Female TR = tr-TR-Wavenet-D.
 const BUILTIN_PROFILES = [
-  { id: 'female-tr', name: 'Ayşe',   lang: 'tr-TR', whisperCode: 'tr', voice: 'tr-TR-Wavenet-E' },
-  { id: 'male-tr',   name: 'Ahmet',  lang: 'tr-TR', whisperCode: 'tr', voice: 'tr-TR-Wavenet-B' },
-  { id: 'female-en', name: 'Sophie', lang: 'en-US', whisperCode: 'en', voice: 'en-US-Wavenet-F' },
-  { id: 'male-en',   name: 'James',  lang: 'en-US', whisperCode: 'en', voice: 'en-US-Wavenet-D' },
-  { id: 'female-de', name: 'Greta',  lang: 'de-DE', whisperCode: 'de', voice: 'de-DE-Wavenet-F' },
-  { id: 'female-ru', name: 'Наташа', lang: 'ru-RU', whisperCode: 'ru', voice: 'ru-RU-Wavenet-A' },
-  { id: 'female-ar', name: 'نور',    lang: 'ar-XA', whisperCode: 'ar', voice: 'ar-XA-Wavenet-A' },
+  { id: 'female-tr', name: 'Ayşe',   gender: 'female', lang: 'tr-TR', whisperCode: 'tr', voice: 'tr-TR-Wavenet-D' },
+  { id: 'male-tr',   name: 'Ahmet',  gender: 'male',   lang: 'tr-TR', whisperCode: 'tr', voice: 'tr-TR-Wavenet-B' },
+  { id: 'female-en', name: 'Sophie', gender: 'female', lang: 'en-US', whisperCode: 'en', voice: 'en-US-Wavenet-F' },
+  { id: 'male-en',   name: 'James',  gender: 'male',   lang: 'en-US', whisperCode: 'en', voice: 'en-US-Wavenet-D' },
+  { id: 'female-de', name: 'Greta',  gender: 'female', lang: 'de-DE', whisperCode: 'de', voice: 'de-DE-Wavenet-F' },
+  { id: 'male-de',   name: 'Hans',   gender: 'male',   lang: 'de-DE', whisperCode: 'de', voice: 'de-DE-Wavenet-B' },
+  { id: 'female-ru', name: 'Наташа', gender: 'female', lang: 'ru-RU', whisperCode: 'ru', voice: 'ru-RU-Wavenet-A' },
+  { id: 'male-ru',   name: 'Иван',   gender: 'male',   lang: 'ru-RU', whisperCode: 'ru', voice: 'ru-RU-Wavenet-B' },
+  { id: 'female-ar', name: 'نور',    gender: 'female', lang: 'ar-XA', whisperCode: 'ar', voice: 'ar-XA-Wavenet-A' },
+  { id: 'male-ar',   name: 'عمر',    gender: 'male',   lang: 'ar-XA', whisperCode: 'ar', voice: 'ar-XA-Wavenet-B' },
 ]
 
 // VAD / timing
 const FRAME_BYTES   = 160
-const SILENCE_MS    = 800
+// End-of-turn silence: lowered 800→500ms so the AI starts answering sooner
+// (snappier perceived latency). Tunable via AI_SILENCE_MS.
+const SILENCE_MS    = parseInt(process.env.AI_SILENCE_MS || '500', 10)
 const MIN_SPEECH_MS = 300
 const MAX_UTTER_MS  = 15000
 const VAD_RMS       = parseInt(process.env.AI_VAD_RMS || '500', 10)
@@ -77,15 +85,68 @@ async function whisperTranscribe(ulawFrames) {
   return { text: (j.text || '').trim(), language: (j.language || '').toLowerCase() }
 }
 
-async function llmReply(history) {
+// Emit each COMPLETE sentence from `pending` via onSentence(); return leftover.
+async function emitSentences(pending, onSentence, shouldStop) {
+  let out = pending
+  while (true) {
+    if (shouldStop && shouldStop()) return out
+    const m = out.match(/^([\s\S]*?[.!?…]+)([\s\S]*)$/)
+    if (!m) break
+    const sentence = m[1].trim()
+    out = m[2]
+    if (sentence) await onSentence(sentence)
+  }
+  return out
+}
+
+/**
+ * Stream the LLM reply token-by-token and fire onSentence() the moment each
+ * sentence completes — so TTS + playback of sentence 1 begin while the model
+ * is still generating sentence 2. This is the main latency win: first audio
+ * lands seconds earlier than waiting for the whole completion. Returns the
+ * full text (to push into history). Falls back to a single non-streamed chunk
+ * if the stream can't be opened.
+ */
+async function llmStream(history, onSentence, shouldStop) {
   const r = await fetch(`${NVIDIA_URL}/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${NVIDIA_KEY}` },
-    body: JSON.stringify({ model: LLM_MODEL, messages: history, temperature: 0.4, max_tokens: 160 }),
+    body: JSON.stringify({ model: LLM_MODEL, messages: history, temperature: 0.4, max_tokens: 220, stream: true }),
     signal: AbortSignal.timeout(20000),
   })
-  const j = await r.json().catch(() => ({}))
-  return (j.choices?.[0]?.message?.content || '').trim()
+
+  if (!r.ok || !r.body || typeof r.body.getReader !== 'function') {
+    const j = await r.json().catch(() => ({}))
+    const txt = (j.choices?.[0]?.message?.content || '').trim()
+    if (txt && !(shouldStop && shouldStop())) await onSentence(txt)
+    return txt
+  }
+
+  const reader = r.body.getReader()
+  const dec = new TextDecoder()
+  let buf = '', full = '', pending = ''
+  while (true) {
+    if (shouldStop && shouldStop()) { try { reader.cancel() } catch {} break }
+    const { value, done } = await reader.read()
+    if (done) break
+    buf += dec.decode(value, { stream: true })
+    const lines = buf.split('\n')
+    buf = lines.pop()
+    for (const line of lines) {
+      const t = line.trim()
+      if (!t.startsWith('data:')) continue
+      const data = t.slice(5).trim()
+      if (!data || data === '[DONE]') continue
+      try {
+        const delta = JSON.parse(data).choices?.[0]?.delta?.content || ''
+        if (delta) { full += delta; pending += delta }
+      } catch {}
+    }
+    pending = await emitSentences(pending, onSentence, shouldStop)
+  }
+  const rest = pending.trim()
+  if (rest && !(shouldStop && shouldStop())) await onSentence(rest)
+  return full.trim()
 }
 
 /** Google Cloud TTS → MULAW 8kHz raw bytes using given lang + voice name */
@@ -104,6 +165,36 @@ async function ttsUlaw(text, lang, voiceName) {
   return Buffer.from(j.audioContent, 'base64')
 }
 
+// Build the pricing rules block injected into the system prompt. With a live
+// priceContext (room types, concepts, future-only prices) the AI enumerates
+// real options and never quotes a past date. Without it, it still refuses
+// past dates and won't invent prices.
+function buildPriceBlock(pc) {
+  const today = (pc && pc.today) || new Date().toISOString().slice(0, 10)
+  if (pc && Array.isArray(pc.roomTypes) && pc.roomTypes.length) {
+    const priceLines = (pc.prices || [])
+      .map(p => `  - ${p.roomType} / ${p.concept}: ${p.from} ${p.currency}'dan başlayan gece fiyatı (geçerli: ${p.validFrom} → ${p.validTo})`)
+      .join('\n')
+    return (
+      `\n\n=== FİYAT & ODA BİLGİSİ ===` +
+      `\nBUGÜNÜN TARİHİ: ${today}. Bu tarihten ÖNCEKİ hiçbir tarih için fiyat verme.` +
+      `\nODA TİPLERİ: ${pc.roomTypes.join(', ')}.` +
+      `\nKONSEPTLER: ${pc.concepts.join(', ')}.` +
+      (priceLines ? `\nGÜNCEL FİYAT LİSTESİ (gece başı):\n${priceLines}` : '') +
+      `\nKURALLAR:` +
+      `\n1) Müşteri fiyat sorduğunda mevcut oda tiplerini TEK TEK say ve her birinin konseptini (pansiyon) belirt.` +
+      `\n2) Fiyat vermeden önce giriş ve çıkış tarihini ve kişi sayısını öğren.` +
+      `\n3) Geçmiş bir tarih istenirse fiyat verme; "geçmiş tarih için fiyat veremiyorum, güncel tarihlerde yardımcı olayım" de.` +
+      `\n4) Listede olmayan oda/tarih için fiyat UYDURMA; bir yetkiliye aktarmayı öner.`
+    )
+  }
+  return (
+    `\n\n=== FİYAT KURALI ===` +
+    `\nBUGÜNÜN TARİHİ: ${today}. Geçmiş tarih için fiyat verme.` +
+    ` Sistemde güncel fiyat tanımlı değil; fiyat UYDURMA. Giriş-çıkış tarihi ile kişi sayısını al, oda tiplerini tek tek say ve kesin fiyat için bir yetkiliye aktarmayı öner.`
+  )
+}
+
 // ── one live AI call ─────────────────────────────────────────────────────────
 class AiCall {
   /**
@@ -115,8 +206,9 @@ class AiCall {
    * @param {string}  [opts.agentName]          — display name of the AI agent
    * @param {Array}   [opts.voiceProfiles]       — [{id,lang,whisperCode,voice,...}]
    * @param {string}  [opts.defaultVoiceProfileId] — which profile to start with
+   * @param {object}  [opts.priceContext]          — { today, currency, roomTypes[], concepts[], prices[] }
    */
-  constructor({ remoteIp, remotePort, onBye, greetingOverride, agentName, voiceProfiles, defaultVoiceProfileId } = {}) {
+  constructor({ remoteIp, remotePort, onBye, greetingOverride, agentName, voiceProfiles, defaultVoiceProfileId, priceContext } = {}) {
     this.remoteIp   = remoteIp
     this.remotePort = remotePort
     this.onBye      = onBye
@@ -126,6 +218,9 @@ class AiCall {
       ? voiceProfiles : BUILTIN_PROFILES
     const defId = defaultVoiceProfileId || 'female-tr'
     this.currentProfile = this.profiles.find(p => p.id === defId) || this.profiles[0]
+    // Lock the operator-selected gender — language auto-switch keeps this gender
+    // so a female agent never flips to a male voice mid-call (and vice-versa).
+    this.lockedGender = this.currentProfile.gender || (this.currentProfile.id.startsWith('male') ? 'male' : 'female')
 
     // Agent identity
     this.agentName = agentName || this.currentProfile.name || 'Asistan'
@@ -135,14 +230,20 @@ class AiCall {
     const defaultGreeting = `${hotel} çağrı merkezine hoş geldiniz, ben ${this.agentName}. Size nasıl yardımcı olabilirim?`
     this._greeting = greetingOverride || defaultGreeting
 
-    // System prompt: handles multiple languages automatically
-    this.systemPrompt = process.env.AI_SYSTEM_PROMPT ||
+    // Pricing block — injected from PPG (real room types/concepts/future prices).
+    const priceBlock = buildPriceBlock(priceContext)
+
+    // System prompt: handles multiple languages automatically. priceBlock is
+    // ALWAYS appended (even when AI_SYSTEM_PROMPT overrides the base) so the
+    // live pricing rules can't be lost.
+    const basePrompt = process.env.AI_SYSTEM_PROMPT ||
       `Sen ${hotel} çağrı merkezinde telefonda görüşen ${this.agentName} adlı bir sesli asistansın.` +
       ` TEMEL KURAL: Arayan kişi hangi dilde konuşuyorsa SEN DE O DİLDE yanıt ver — dil değiştirme, sadece eşleştir.` +
       ` Türkçe, İngilizce, Almanca, Rusça ve Arapça konuşabilirsin.` +
-      ` Yanıtlarını KISA tut — telefonda olduğun için 1-2 cümleyi geçme.` +
+      ` Yanıtlarını kısa ve net tut; fiyat ya da oda tiplerini sayarken madde madde, tek tek belirt.` +
       ` Rezervasyon, oda, olanak, konum, fiyat ve ulaşım sorularında yardımcı ol.` +
       ` Kesin bilmediğin konuları uydurma; bir yetkiliye bağlamayı öner. Sıcak ve doğal konuş.`
+    this.systemPrompt = basePrompt + priceBlock
 
     this.seq  = (Math.random() * 0xffff) | 0
     this.ts   = (Math.random() * 0xffffffff) >>> 0
@@ -164,15 +265,22 @@ class AiCall {
       LOG(`RTP bound :${AI_RTP_PORT} peer=${remoteIp}:${remotePort} profile=${this.currentProfile.id}`))
 
     this.pacer = setInterval(() => this.tick(), 20)
-    setTimeout(() => this.say(this._greeting), 700)
+    setTimeout(() => this.say(this._greeting), 400)
   }
 
-  /** Pick the voice profile whose whisperCode matches the detected language */
+  /**
+   * Switch to the detected language but KEEP the locked gender. Prefer a
+   * profile matching (language + lockedGender); only if none exists fall back
+   * to any profile for that language. This stops a female agent flipping to a
+   * male voice (the reported bug) when the caller speaks another language.
+   */
   switchProfileByLang(detectedLang) {
     if (!detectedLang) return
-    const match = this.profiles.find(p => p.whisperCode === detectedLang)
+    const sameGender = this.profiles.find(p => p.whisperCode === detectedLang && p.gender === this.lockedGender)
+    const anyLang    = this.profiles.find(p => p.whisperCode === detectedLang)
+    const match = sameGender || anyLang
     if (match && match.id !== this.currentProfile.id) {
-      LOG(`lang switch: ${this.currentProfile.id} → ${match.id} (whisper=${detectedLang})`)
+      LOG(`lang switch: ${this.currentProfile.id} → ${match.id} (whisper=${detectedLang}, gender=${this.lockedGender})`)
       this.currentProfile = match
     }
   }
@@ -210,14 +318,21 @@ class AiCall {
       const { text, language } = await whisperTranscribe(audio)
       LOG('STT:', JSON.stringify(text), 'lang:', language)
       if (!text || this.closed) { this.busy = false; return }
-      // Switch voice to match caller's language
+      // Switch voice to match caller's language (gender preserved)
       this.switchProfileByLang(language)
       this.history.push({ role: 'user', content: text })
-      const reply = await llmReply(this.history)
+      // Stream the reply: TTS+play each sentence as soon as it's ready so the
+      // caller hears the first words seconds earlier. shouldStop aborts on
+      // hang-up or barge-in (caller starts talking over the AI).
+      const stop = () => this.closed || this.cancelResponse
+      const reply = await llmStream(this.history, (sentence) => this.say(sentence), stop)
       LOG('LLM:', JSON.stringify(reply))
-      if (this.closed || this.cancelResponse) { this.busy = false; return }
-      this.history.push({ role: 'assistant', content: reply || 'Anlayamadım, tekrar eder misiniz?' })
-      await this.say(reply || 'Anlayamadım, tekrar eder misiniz?')
+      if (this.closed) { this.busy = false; return }
+      if (reply) {
+        this.history.push({ role: 'assistant', content: reply })
+      } else if (!this.cancelResponse) {
+        await this.say('Anlayamadım, tekrar eder misiniz?')
+      }
     } catch (e) {
       LOG('turn error:', e.message)
       try { await this.say('Bir sorun oluştu, lütfen tekrar söyler misiniz?') } catch {}
