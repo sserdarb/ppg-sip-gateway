@@ -485,7 +485,7 @@ async function handleInboundInvite(sip, rinfo) {
   console.log(`[inbound] DID ${did} → route=${route.kind} reason=${reason}`)
 
   if (route.kind === 'ai') {
-    await handleInboundAi(sip, rinfo, callId, fromTag, trunk)
+    await handleInboundAi(sip, rinfo, callId, fromTag, trunk, routeInfo?.ai)
   } else if (route.kind === 'external' && route.externalNumber) {
     // Forward to external number via PBX re-INVITE (future)
     console.log(`[inbound] external forward to ${route.externalNumber} — not yet implemented`)
@@ -496,7 +496,7 @@ async function handleInboundInvite(sip, rinfo) {
   }
 }
 
-async function handleInboundAi(sip, rinfo, callId, fromTag, trunk) {
+async function handleInboundAi(sip, rinfo, callId, fromTag, trunk, aiCfg) {
   const { body } = splitSipMessage(sip)
   if (!body) {
     udp.send(Buffer.from(buildUdpResponse(sip, 488, 'Not Acceptable Here')), rinfo.port, rinfo.address)
@@ -538,10 +538,17 @@ async function handleInboundAi(sip, rinfo, callId, fromTag, trunk) {
   })
   udp.send(Buffer.from(ok200), rinfo.port, rinfo.address)
 
-  const greetingOverride = trunk?.greetingText || undefined
-  const call = new AiCall({ remoteIp: pbxIp, remotePort: pbxPort, greetingOverride })
+  const call = new AiCall({
+    remoteIp: pbxIp,
+    remotePort: pbxPort,
+    greetingOverride:      aiCfg?.greeting      || trunk?.greetingText || undefined,
+    agentName:             aiCfg?.agentName      || undefined,
+    voiceProfiles:         aiCfg?.voiceProfiles  || undefined,
+    defaultVoiceProfileId: aiCfg?.defaultVoiceProfileId || undefined,
+  })
   inboundAiDialogs.set(callId, { call, fromAddr: rinfo, toTag, fromTag })
-  console.log(`[inbound:ai] answered ${callId} — PBX ${pbxIp}:${pbxPort} ↔ AI :${AI_RTP_PORT}`)
+  const profileId = call.currentProfile?.id || '?'
+  console.log(`[inbound:ai] answered ${callId} — PBX ${pbxIp}:${pbxPort} ↔ AI :${AI_RTP_PORT} agent=${call.agentName} profile=${profileId}`)
 }
 
 function handleInboundAiDialog(sip, rinfo, callId) {
