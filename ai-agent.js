@@ -257,6 +257,11 @@ class AiCall {
     this.silenceMs  = 0
     this.busy       = false
     this.closed     = false
+    // TTS pipeline: start fetches in parallel, queue audio in sentence order.
+    // _pendingTts tracks how many TTS fetches are in-flight so tick() knows
+    // not to flip speaking=false while more audio is about to arrive.
+    this._sayChain   = Promise.resolve()
+    this._pendingTts = 0
 
     this.sock = dgram.createSocket('udp4')
     this.sock.on('message', (m) => this.onRtp(m))
@@ -294,7 +299,13 @@ class AiCall {
     const voiced = rms > VAD_RMS
 
     if (voiced) {
-      if (this.speaking) { this.playQueue.length = 0; this.speaking = false; this.cancelResponse = true }
+      if (this.speaking || this._pendingTts > 0) {
+        this.playQueue.length = 0
+        this.speaking = false
+        this.cancelResponse = true
+        this._pendingTts = 0
+        this._sayChain = Promise.resolve()  // abandon in-flight chain items
+      }
       this.inSpeech = true
       this.silenceMs = 0
       this.speechMs += 20
@@ -340,20 +351,31 @@ class AiCall {
     this.busy = false
   }
 
-  async say(text) {
+  // Non-blocking: kicks off TTS fetch immediately (parallel with previous sentences
+  // still playing), then chains the queue-push so sentences stay in order.
+  // This eliminates the inter-sentence silence gap caused by sequential fetching.
+  say(text) {
     if (this.closed || !text) return
-    let ulaw
     const { lang, voice } = this.currentProfile
-    try { ulaw = await ttsUlaw(text, lang, voice) } catch (e) { LOG('tts err', e.message); return }
-    if (this.closed || this.cancelResponse) return
-    for (let i = 0; i + FRAME_BYTES <= ulaw.length; i += FRAME_BYTES) this.playQueue.push(ulaw.subarray(i, i + FRAME_BYTES))
-    this.speaking = true
+    this._pendingTts++
+    // Start the network fetch RIGHT NOW — before the previous sentence finishes playing.
+    const fetchP = ttsUlaw(text, lang, voice).catch(e => { LOG('tts err', e.message); return null })
+    // Queue audio only after previous say() has finished queuing (order preserved).
+    this._sayChain = this._sayChain.then(async () => {
+      const ulaw = await fetchP
+      this._pendingTts--
+      if (!ulaw || this.closed || this.cancelResponse) return
+      for (let i = 0; i + FRAME_BYTES <= ulaw.length; i += FRAME_BYTES)
+        this.playQueue.push(ulaw.subarray(i, i + FRAME_BYTES))
+      this.speaking = true
+    })
   }
 
   tick() {
     if (this.closed) return
     let frame = this.playQueue.shift()
-    if (!frame) { if (this.speaking && this.playQueue.length === 0) this.speaking = false; frame = SILENCE_FRAME }
+    // Only stop speaking when queue is empty AND no TTS fetch is still in flight.
+    if (!frame) { if (this.speaking && this._pendingTts === 0) this.speaking = false; frame = SILENCE_FRAME }
     const pkt = Buffer.alloc(12 + frame.length)
     pkt[0] = 0x80; pkt[1] = 0x00
     pkt.writeUInt16BE(this.seq & 0xffff, 2); this.seq = (this.seq + 1) & 0xffff
