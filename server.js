@@ -442,9 +442,13 @@ async function handleInboundInvite(sip, rinfo) {
   const didMatch = reqLine.match(/^INVITE\s+sips?:(\+?[\d]+)(?:@|\s)/i)
   const did = didMatch ? didMatch[1] : null
   const callId = (sip.match(/^Call-ID:\s*([^\r\n]+)/im)?.[1] || '').trim()
-  const fromTag = extractTag(extractHeader(sip, 'From'))
+  const fromHeader = extractHeader(sip, 'From')
+  const fromTag = extractTag(fromHeader)
+  // Caller's number from the From URI (sip:CALLER@host) — used by PPG to pick
+  // the contract currency (TR/Cyprus → TRY, others → EUR).
+  const caller = (fromHeader.match(/sips?:(\+?[\d]+)@/i)?.[1] || '').trim()
 
-  console.log(`[inbound] INVITE did=${did} call=${callId} from=${rinfo.address}:${rinfo.port}`)
+  console.log(`[inbound] INVITE did=${did} call=${callId} caller=${caller || '?'} from=${rinfo.address}:${rinfo.port}`)
 
   // 100 Trying
   udp.send(Buffer.from(buildUdpResponse(sip, 100, 'Trying')), rinfo.port, rinfo.address)
@@ -457,7 +461,7 @@ async function handleInboundInvite(sip, rinfo) {
   // PPG DID lookup
   let routeInfo = null
   try {
-    const url = `${PPG_API_URL}/api/cc/route?did=${encodeURIComponent(did)}`
+    const url = `${PPG_API_URL}/api/cc/route?did=${encodeURIComponent(did)}${caller ? `&caller=${encodeURIComponent(caller)}` : ''}`
     const fetchHeaders = GATEWAY_SECRET ? { 'x-gateway-secret': GATEWAY_SECRET } : {}
     const r = await fetch(url, { headers: fetchHeaders, signal: AbortSignal.timeout(6000) })
     routeInfo = await r.json()
@@ -546,6 +550,7 @@ async function handleInboundAi(sip, rinfo, callId, fromTag, trunk, aiCfg) {
     voiceProfiles:         aiCfg?.voiceProfiles  || undefined,
     defaultVoiceProfileId: aiCfg?.defaultVoiceProfileId || undefined,
     priceContext:          aiCfg?.priceContext   || undefined,
+    hotelInfo:             aiCfg?.hotelInfo      || undefined,
   })
   inboundAiDialogs.set(callId, { call, fromAddr: rinfo, toTag, fromTag })
   const profileId = call.currentProfile?.id || '?'

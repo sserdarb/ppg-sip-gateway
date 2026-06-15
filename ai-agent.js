@@ -41,6 +41,16 @@ const BUILTIN_PROFILES = [
   { id: 'male-ar',   name: 'عمر',    gender: 'male',   lang: 'ar-XA', whisperCode: 'ar', voice: 'ar-XA-Wavenet-B' },
 ]
 
+// "Buying time" fillers per language — spoken instantly when the caller stops
+// so they hear acknowledgement while STT+LLM run (covers response latency).
+const FILLERS = {
+  tr: ['Tabii, hemen bakıyorum.', 'Bir saniye, kontrol ediyorum.', 'Hemen yardımcı oluyorum efendim.'],
+  en: ['Sure, let me check that for you.', 'One moment, looking into it.', 'Right away, checking now.'],
+  de: ['Einen Moment, ich schaue gleich nach.', 'Sekunde, ich prüfe das für Sie.'],
+  ru: ['Секунду, сейчас проверю.', 'Минуту, уточняю для вас.'],
+  ar: ['لحظة من فضلك، أتحقق الآن.', 'لحظة واحدة، سأتحقق لك.'],
+}
+
 // VAD / timing
 const FRAME_BYTES   = 160
 // End-of-turn silence: lowered 800→500ms so the AI starts answering sooner
@@ -195,6 +205,26 @@ function buildPriceBlock(pc) {
   )
 }
 
+// Build the hotel-facts block injected into the system prompt so the AI
+// describes the property from REAL data (hotel record + concierge KB), not
+// invention. Empty string when no info is available.
+function buildHotelBlock(h) {
+  if (!h) return ''
+  const lines = ['\n\n=== OTEL BİLGİLERİ (oteli SADECE bunlarla anlat, uydurma) ===']
+  const loc = [h.city, h.country].filter(Boolean).join(', ')
+  lines.push(`Otel: ${h.name}${h.stars ? ` (${h.stars} yıldız)` : ''}${loc ? `, ${loc}` : ''}.`)
+  if (h.concept)   lines.push(`Konsept: ${h.concept}.`)
+  if (h.address)   lines.push(`Adres: ${h.address}.`)
+  if (h.website)   lines.push(`Web sitesi: ${h.website}.`)
+  if (Array.isArray(h.amenities) && h.amenities.length) lines.push(`Olanaklar: ${h.amenities.join(', ')}.`)
+  if (Array.isArray(h.kb) && h.kb.length) {
+    lines.push('Doğrulanmış bilgiler (sık sorulanlar):')
+    for (const e of h.kb) lines.push(`- ${e.q ? e.q + ': ' : ''}${e.a}`)
+  }
+  lines.push('Otel hakkında konuşurken yukarıdaki bilgileri kullan; emin olmadığını uydurma, gerekiyorsa yetkiliye aktarmayı öner.')
+  return lines.join('\n')
+}
+
 // ── one live AI call ─────────────────────────────────────────────────────────
 class AiCall {
   /**
@@ -207,8 +237,9 @@ class AiCall {
    * @param {Array}   [opts.voiceProfiles]       — [{id,lang,whisperCode,voice,...}]
    * @param {string}  [opts.defaultVoiceProfileId] — which profile to start with
    * @param {object}  [opts.priceContext]          — { today, currency, roomTypes[], concepts[], prices[] }
+   * @param {object}  [opts.hotelInfo]             — { name, city, country, stars, concept, website, amenities[], kb[] }
    */
-  constructor({ remoteIp, remotePort, onBye, greetingOverride, agentName, voiceProfiles, defaultVoiceProfileId, priceContext } = {}) {
+  constructor({ remoteIp, remotePort, onBye, greetingOverride, agentName, voiceProfiles, defaultVoiceProfileId, priceContext, hotelInfo } = {}) {
     this.remoteIp   = remoteIp
     this.remotePort = remotePort
     this.onBye      = onBye
@@ -230,12 +261,13 @@ class AiCall {
     const defaultGreeting = `${hotel} çağrı merkezine hoş geldiniz, ben ${this.agentName}. Size nasıl yardımcı olabilirim?`
     this._greeting = greetingOverride || defaultGreeting
 
-    // Pricing block — injected from PPG (real room types/concepts/future prices).
+    // Pricing + hotel-info blocks — injected from PPG (real data).
     const priceBlock = buildPriceBlock(priceContext)
+    const hotelBlock = buildHotelBlock(hotelInfo)
 
-    // System prompt: handles multiple languages automatically. priceBlock is
-    // ALWAYS appended (even when AI_SYSTEM_PROMPT overrides the base) so the
-    // live pricing rules can't be lost.
+    // System prompt: handles multiple languages automatically. priceBlock +
+    // hotelBlock are ALWAYS appended (even when AI_SYSTEM_PROMPT overrides the
+    // base) so live pricing/hotel facts can't be lost.
     const basePrompt = process.env.AI_SYSTEM_PROMPT ||
       `Sen ${hotel} çağrı merkezinde telefonda görüşen ${this.agentName} adlı bir sesli asistansın.` +
       ` TEMEL KURAL: Arayan kişi hangi dilde konuşuyorsa SEN DE O DİLDE yanıt ver — dil değiştirme, sadece eşleştir.` +
@@ -243,7 +275,12 @@ class AiCall {
       ` Yanıtlarını kısa ve net tut; fiyat ya da oda tiplerini sayarken madde madde, tek tek belirt.` +
       ` Rezervasyon, oda, olanak, konum, fiyat ve ulaşım sorularında yardımcı ol.` +
       ` Kesin bilmediğin konuları uydurma; bir yetkiliye bağlamayı öner. Sıcak ve doğal konuş.`
-    this.systemPrompt = basePrompt + priceBlock
+    this.systemPrompt = basePrompt + priceBlock + hotelBlock
+
+    // Filler ("buying time") phrases — pre-synthesized so the AI acknowledges
+    // instantly the moment the caller stops talking, covering STT+LLM latency.
+    this.fillerCache = new Map()  // voiceName → Map(text → ulawBuffer)
+    this.fillerIdx = 0
 
     this.seq  = (Math.random() * 0xffff) | 0
     this.ts   = (Math.random() * 0xffffffff) >>> 0
@@ -270,7 +307,54 @@ class AiCall {
       LOG(`RTP bound :${AI_RTP_PORT} peer=${remoteIp}:${remotePort} profile=${this.currentProfile.id}`))
 
     this.pacer = setInterval(() => this.tick(), 20)
-    setTimeout(() => this.say(this._greeting), 400)
+    // Greeting: wait ~900ms for the PBX/rtpengine media path to settle, then
+    // push ~300ms of lead-in silence so the first syllable isn't clipped
+    // (early frames can be dropped before the remote starts accepting RTP).
+    setTimeout(() => {
+      if (this.closed) return
+      for (let i = 0; i < 15; i++) this.playQueue.push(SILENCE_FRAME)
+      this.speaking = true
+      this.say(this._greeting)
+    }, 900)
+    // Warm one filler for the starting voice so the first turn is instant.
+    this.prewarmFiller()
+  }
+
+  /**
+   * Pre-synthesize ALL fillers for the current voice so playFiller() can push
+   * synchronously from cache (no await → no reordering vs the streamed reply).
+   * Non-blocking; safe to call again after a language/voice switch.
+   */
+  async prewarmFiller() {
+    const { lang, voice, whisperCode } = this.currentProfile
+    const list = FILLERS[whisperCode] || FILLERS.tr
+    let cache = this.fillerCache.get(voice)
+    if (!cache) { cache = new Map(); this.fillerCache.set(voice, cache) }
+    for (const text of list) {
+      if (cache.has(text)) continue
+      try { cache.set(text, await ttsUlaw(text, lang, voice)) } catch (e) { LOG('filler prewarm err', e.message) }
+    }
+  }
+
+  /**
+   * Play a short "buying time" filler immediately. Pushes synchronously from
+   * the pre-warmed cache (so it lands BEFORE the streamed reply); if not yet
+   * cached, fetches in the background and warms for next time.
+   */
+  playFiller() {
+    const { lang, voice, whisperCode } = this.currentProfile
+    const list = FILLERS[whisperCode] || FILLERS.tr
+    const text = list[this.fillerIdx++ % list.length]
+    const cache = this.fillerCache.get(voice)
+    const ulaw = cache && cache.get(text)
+    if (ulaw) {
+      if (this.closed || this.cancelResponse) return
+      for (let i = 0; i + FRAME_BYTES <= ulaw.length; i += FRAME_BYTES) this.playQueue.push(ulaw.subarray(i, i + FRAME_BYTES))
+      this.speaking = true
+    } else {
+      // Cache miss (e.g. right after a language switch) — warm for next turn.
+      this.prewarmFiller().catch(() => {})
+    }
   }
 
   /**
@@ -287,6 +371,7 @@ class AiCall {
     if (match && match.id !== this.currentProfile.id) {
       LOG(`lang switch: ${this.currentProfile.id} → ${match.id} (whisper=${detectedLang}, gender=${this.lockedGender})`)
       this.currentProfile = match
+      this.prewarmFiller().catch(() => {})  // warm fillers for the new language
     }
   }
 
@@ -325,6 +410,10 @@ class AiCall {
     this.inSpeech = false; this.speechMs = 0; this.silenceMs = 0; this.utter = []
     if (ms < MIN_SPEECH_MS) return
     this.busy = true; this.cancelResponse = false
+    // The caller stopped talking → acknowledge INSTANTLY with a short filler
+    // ("bir saniye, kontrol ediyorum") that plays while STT+LLM run. Only for
+    // real utterances (≥1s) so a quick "evet/tamam" doesn't trigger it.
+    if (ms >= 1000) this.playFiller()
     try {
       const { text, language } = await whisperTranscribe(audio)
       LOG('STT:', JSON.stringify(text), 'lang:', language)
