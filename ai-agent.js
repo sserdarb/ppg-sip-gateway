@@ -251,10 +251,17 @@ class AiCall {
    * @param {object}  [opts.priceContext]          — { today, currency, roomTypes[], concepts[], prices[] }
    * @param {object}  [opts.hotelInfo]             — { name, city, country, stars, concept, website, amenities[], kb[] }
    */
-  constructor({ remoteIp, remotePort, onBye, greetingOverride, agentName, voiceProfiles, defaultVoiceProfileId, priceContext, hotelInfo } = {}) {
+  constructor({ remoteIp, remotePort, onBye, greetingOverride, agentName, voiceProfiles, defaultVoiceProfileId, priceContext, hotelInfo, hotelId, callId, caller, onEnd } = {}) {
     this.remoteIp   = remoteIp
     this.remotePort = remotePort
     this.onBye      = onBye
+    // Call metadata for the post-call lead record (name/phone capture).
+    this.hotelId    = hotelId || null
+    this.callId     = callId || null
+    this.caller     = caller || null
+    this.onEnd      = onEnd || null
+    this.startedAt  = Date.now()
+    this._reported  = false
 
     // Resolve voice profiles
     this.profiles = (Array.isArray(voiceProfiles) && voiceProfiles.length)
@@ -287,7 +294,20 @@ class AiCall {
       ` Yanıtlarını kısa ve net tut; fiyat ya da oda tiplerini sayarken madde madde, tek tek belirt.` +
       ` Rezervasyon, oda, olanak, konum, fiyat ve ulaşım sorularında yardımcı ol.` +
       ` Kesin bilmediğin konuları uydurma; bir yetkiliye bağlamayı öner. Sıcak ve doğal konuş.`
-    this.systemPrompt = basePrompt + priceBlock + hotelBlock
+
+    // Conversation flow — always appended so the AI runs a warm, human flow:
+    // greet → get the caller's NAME (then use it) → ask how they are & respond
+    // kindly → naturally take a PHONE number → light small talk → present info
+    // with a nice lead-in. This also covers the brief data/STT/LLM wait time.
+    const convoBlock =
+      `\n\n=== GÖRÜŞME AKIŞI (doğal, sıcak, insancıl) ===` +
+      `\n1) Sıcak selamla ve kendini "${this.agentName}" olarak tanıt.` +
+      `\n2) İLK İŞ: arayanın adını kibarca öğren ("Memnun oldum, adınızı öğrenebilir miyim?"). Adı öğrendikten sonra konuşma boyunca ismiyle hitap et (örn. "Ahmet Bey", "Ayşe Hanım").` +
+      `\n3) Kısaca nasıl olduğunu sor ("Nasılsınız, bugün size nasıl yardımcı olabilirim?"). Cevabına göre KİBARCA karşılık ver: iyiyse sevincini paylaş, yorgun/keyifsizse nazik ve anlayışlı ol.` +
+      `\n4) Uygun bir anda, size özel teklif/bilgi iletebilmek için telefon numarasını rica et ("Size özel bir teklif hazırlayıp iletebilmem için telefon numaranızı alabilir miyim?"). Numarayı tekrar ederek doğrula.` +
+      `\n5) Bilgileri verirken robotik olma; kısa, samimi bir girişle başla ("Tabii efendim, hemen ileteyim..."). Sonra oda tiplerini/fiyatları/olanakları net ve düzenli anlat.` +
+      `\n6) Konuşmayı doğal tut; tek seferde çok soru sorma, karşılıklı sohbet et. Telefonda olduğun için cümlelerini kısa ve akıcı kur.`
+    this.systemPrompt = basePrompt + convoBlock + priceBlock + hotelBlock
 
     // Filler ("buying time") phrases — pre-synthesized so the AI acknowledges
     // instantly the moment the caller stops talking, covering STT+LLM latency.
@@ -546,6 +566,20 @@ class AiCall {
     clearInterval(this.pacer)
     try { this.sock.close() } catch {}
     LOG('call closed')
+    // Report the call for lead capture (name/phone → CallRecord). Fire-and-forget.
+    if (this.onEnd && !this._reported) {
+      this._reported = true
+      try {
+        this.onEnd({
+          hotelId: this.hotelId,
+          callId: this.callId,
+          caller: this.caller,
+          startedAt: this.startedAt,
+          endedAt: Date.now(),
+          transcript: (this.history || []).filter(m => m.role !== 'system'),
+        })
+      } catch (e) { LOG('onEnd err', e.message) }
+    }
   }
 }
 

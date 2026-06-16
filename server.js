@@ -489,7 +489,7 @@ async function handleInboundInvite(sip, rinfo) {
   console.log(`[inbound] DID ${did} → route=${route.kind} reason=${reason}`)
 
   if (route.kind === 'ai') {
-    await handleInboundAi(sip, rinfo, callId, fromTag, trunk, routeInfo?.ai)
+    await handleInboundAi(sip, rinfo, callId, fromTag, trunk, routeInfo?.ai, routeInfo?.hotelId, caller)
   } else if (route.kind === 'external' && route.externalNumber) {
     // Forward to external number via PBX re-INVITE (future)
     console.log(`[inbound] external forward to ${route.externalNumber} — not yet implemented`)
@@ -500,7 +500,22 @@ async function handleInboundInvite(sip, rinfo) {
   }
 }
 
-async function handleInboundAi(sip, rinfo, callId, fromTag, trunk, aiCfg) {
+// Post-call lead capture: send the transcript + meta to PPG, which extracts the
+// caller's name/phone and creates a CallRecord. Fire-and-forget; never blocks.
+async function reportCallRecord(meta) {
+  try {
+    if (!meta || !meta.hotelId) return
+    await fetch(`${PPG_API_URL}/api/cc/call-record`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(GATEWAY_SECRET ? { 'x-gateway-secret': GATEWAY_SECRET } : {}) },
+      body: JSON.stringify(meta),
+      signal: AbortSignal.timeout(10000),
+    })
+    console.log(`[call-record] reported call ${meta.callId} (${(meta.transcript || []).length} turns)`)
+  } catch (e) { console.error('[call-record] report failed:', e.message) }
+}
+
+async function handleInboundAi(sip, rinfo, callId, fromTag, trunk, aiCfg, hotelId, caller) {
   const { body } = splitSipMessage(sip)
   if (!body) {
     udp.send(Buffer.from(buildUdpResponse(sip, 488, 'Not Acceptable Here')), rinfo.port, rinfo.address)
@@ -551,6 +566,10 @@ async function handleInboundAi(sip, rinfo, callId, fromTag, trunk, aiCfg) {
     defaultVoiceProfileId: aiCfg?.defaultVoiceProfileId || undefined,
     priceContext:          aiCfg?.priceContext   || undefined,
     hotelInfo:             aiCfg?.hotelInfo      || undefined,
+    hotelId,
+    callId,
+    caller,
+    onEnd:                 reportCallRecord,
   })
   inboundAiDialogs.set(callId, { call, fromAddr: rinfo, toTag, fromTag })
   const profileId = call.currentProfile?.id || '?'
