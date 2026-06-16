@@ -355,7 +355,7 @@ class AiCall {
     const ulaw = cache && cache.get(text)
     if (ulaw) {
       if (this.closed || this.cancelResponse) return
-      for (let i = 0; i + FRAME_BYTES <= ulaw.length; i += FRAME_BYTES) this.playQueue.push(ulaw.subarray(i, i + FRAME_BYTES))
+      this._enqueue(ulaw)
       this.speaking = true
     } else {
       // Cache miss (e.g. right after a language switch) — warm for next turn.
@@ -482,14 +482,45 @@ class AiCall {
       const ulaw = await fetchP
       this._pendingTts--
       if (!ulaw || this.closed || this.cancelResponse) return
-      for (let i = 0; i + FRAME_BYTES <= ulaw.length; i += FRAME_BYTES)
-        this.playQueue.push(ulaw.subarray(i, i + FRAME_BYTES))
+      this._enqueue(ulaw)
       this.speaking = true
     })
   }
 
+  /**
+   * Queue a µ-law buffer as 20ms frames. The final <160-byte remainder is
+   * PADDED with µ-law silence instead of being dropped — dropping it clipped
+   * a few ms off the end of every TTS chunk, causing the audible clicks/
+   * dropouts between sentences.
+   */
+  _enqueue(ulaw) {
+    let i = 0
+    for (; i + FRAME_BYTES <= ulaw.length; i += FRAME_BYTES) this.playQueue.push(ulaw.subarray(i, i + FRAME_BYTES))
+    if (i < ulaw.length) {
+      const last = Buffer.alloc(FRAME_BYTES, 0xff)  // 0xFF = µ-law silence
+      ulaw.copy(last, 0, i)
+      this.playQueue.push(last)
+    }
+  }
+
+  // Drift-correcting pacer: Node timers fire late under load, which left audible
+  // gaps between 20ms frames. Each tick sends as many frames as real elapsed
+  // time requires (catch-up), so timer jitter no longer becomes audio jitter.
   tick() {
     if (this.closed) return
+    const now = Date.now()
+    if (!this._nextTs) this._nextTs = now
+    let budget = 0
+    while (this._nextTs <= now && budget < 12) {
+      this._sendFrame()
+      this._nextTs += 20
+      budget++
+    }
+    // If we fell badly behind (e.g. long GC pause), resync to avoid a burst storm.
+    if (now - this._nextTs > 200) this._nextTs = now
+  }
+
+  _sendFrame() {
     let frame = this.playQueue.shift()
     // Only stop speaking when queue is empty AND no TTS fetch is still in flight.
     if (!frame) { if (this.speaking && this._pendingTts === 0) this.speaking = false; frame = SILENCE_FRAME }
