@@ -216,8 +216,10 @@ function buildPriceBlock(pc) {
 function buildHotelBlock(h) {
   if (!h) return ''
   const lines = ['\n\n=== OTEL BİLGİLERİ (oteli SADECE bunlarla anlat, uydurma) ===']
-  const loc = [h.city, h.country].filter(Boolean).join(', ')
-  lines.push(`Otel: ${h.name}${h.stars ? ` (${h.stars} yıldız)` : ''}${loc ? `, ${loc}` : ''}.`)
+  if (h.name) {
+    const loc = [h.city, h.country].filter(Boolean).join(', ')
+    lines.push(`Otel: ${h.name}${h.stars ? ` (${h.stars} yıldız)` : ''}${loc ? `, ${loc}` : ''}.`)
+  }
   if (h.concept)   lines.push(`Konsept: ${h.concept}.`)
   if (h.address)   lines.push(`Adres: ${h.address}.`)
   if (h.website)   lines.push(`Web sitesi: ${h.website}.`)
@@ -226,7 +228,12 @@ function buildHotelBlock(h) {
     lines.push('Doğrulanmış bilgiler (sık sorulanlar):')
     for (const e of h.kb) lines.push(`- ${e.q ? e.q + ': ' : ''}${e.a}`)
   }
-  lines.push('Otel hakkında konuşurken yukarıdaki bilgileri kullan; emin olmadığını uydurma, gerekiyorsa yetkiliye aktarmayı öner.')
+  // Free-text training document edited by the hotel in the admin panel.
+  if (h.trainingDoc && h.trainingDoc.trim()) {
+    lines.push('\n--- EĞİTİM DÖKÜMANI (otelin hazırladığı bilgi) ---')
+    lines.push(h.trainingDoc.trim())
+  }
+  lines.push('\nOtel hakkında konuşurken yukarıdaki bilgileri kullan; emin olmadığını uydurma, gerekiyorsa yetkiliye aktarmayı öner.')
   return lines.join('\n')
 }
 
