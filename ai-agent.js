@@ -59,6 +59,11 @@ const SILENCE_MS    = parseInt(process.env.AI_SILENCE_MS || '500', 10)
 const MIN_SPEECH_MS = 300
 const MAX_UTTER_MS  = 15000
 const VAD_RMS       = parseInt(process.env.AI_VAD_RMS || '500', 10)
+// Barge-in (interrupting the AI WHILE it speaks) needs a louder + SUSTAINED
+// voice than normal capture — otherwise the AI's own echo on the phone bridge
+// (no AEC) trips it and the AI cuts itself off mid-sentence. Tunable.
+const BARGE_RMS     = parseInt(process.env.AI_BARGE_RMS || '1100', 10)
+const BARGE_MIN_MS  = parseInt(process.env.AI_BARGE_MS  || '320', 10)
 
 // ── G.711 µ-law codec ────────────────────────────────────────────────────────
 const ULAW_DECODE = new Int16Array(256)
@@ -299,6 +304,7 @@ class AiCall {
     // not to flip speaking=false while more audio is about to arrive.
     this._sayChain   = Promise.resolve()
     this._pendingTts = 0
+    this.bargeMs     = 0   // consecutive loud-input ms while AI speaks (barge-in)
 
     this.sock = dgram.createSocket('udp4')
     this.sock.on('message', (m) => this.onRtp(m))
@@ -381,16 +387,38 @@ class AiCall {
     let sum = 0
     for (let i = 0; i < payload.length; i++) { const s = ulawByteToPcm(payload[i]); sum += s * s }
     const rms = Math.sqrt(sum / Math.max(1, payload.length))
-    const voiced = rms > VAD_RMS
 
-    if (voiced) {
-      if (this.speaking || this._pendingTts > 0) {
-        this.playQueue.length = 0
-        this.speaking = false
-        this.cancelResponse = true
-        this._pendingTts = 0
-        this._sayChain = Promise.resolve()  // abandon in-flight chain items
+    // ── While the AI is talking OR thinking: HALF-DUPLEX guard ──
+    // The phone bridge has no echo cancellation, so the AI's own voice (and the
+    // filler) loops back as "input". While speaking/fetching/processing, only a
+    // LOUDER, SUSTAINED voice counts as a real barge-in; anything else is
+    // ignored so the AI never cuts itself off on echo/noise.
+    if (this.speaking || this._pendingTts > 0 || this.busy) {
+      if (rms > BARGE_RMS) {
+        this.bargeMs += 20
+        if (this.bargeMs >= BARGE_MIN_MS) {
+          this.playQueue.length = 0
+          this.speaking = false
+          this.cancelResponse = true
+          this._pendingTts = 0
+          this._sayChain = Promise.resolve()  // abandon in-flight chain items
+          // Start capturing the caller's interrupting utterance from here.
+          this.bargeMs = 0
+          this.inSpeech = true
+          this.silenceMs = 0
+          this.speechMs = BARGE_MIN_MS
+          this.utter = [Buffer.from(payload)]
+        }
+      } else {
+        this.bargeMs = 0  // must be continuous to count as barge-in
       }
+      return  // don't let echo leak into the normal capture path
+    }
+    this.bargeMs = 0
+
+    // ── AI silent: normal capture VAD ──
+    const voiced = rms > VAD_RMS
+    if (voiced) {
       this.inSpeech = true
       this.silenceMs = 0
       this.speechMs += 20
