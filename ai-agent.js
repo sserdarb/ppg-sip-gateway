@@ -43,19 +43,24 @@ const BUILTIN_PROFILES = [
 
 // "Buying time" fillers per language — spoken instantly when the caller stops
 // so they hear acknowledgement while STT+LLM run (covers response latency).
+// Short, NEUTRAL acknowledgements played the instant the caller stops — they
+// fit any turn (chat or lookup) and just signal "I'm with you" while the reply
+// is generated. Kept generic on purpose ("checking the system" sounds wrong
+// when the caller just said their name).
 const FILLERS = {
-  tr: ['Tabii, hemen bakıyorum.', 'Bir saniye, kontrol ediyorum.', 'Hemen yardımcı oluyorum efendim.'],
-  en: ['Sure, let me check that for you.', 'One moment, looking into it.', 'Right away, checking now.'],
-  de: ['Einen Moment, ich schaue gleich nach.', 'Sekunde, ich prüfe das für Sie.'],
-  ru: ['Секунду, сейчас проверю.', 'Минуту, уточняю для вас.'],
-  ar: ['لحظة من فضلك، أتحقق الآن.', 'لحظة واحدة، سأتحقق لك.'],
+  tr: ['Tabii efendim.', 'Anladım.', 'Peki efendim.'],
+  en: ['Of course.', 'I see.', 'Sure.'],
+  de: ['Natürlich.', 'Verstehe.', 'Gerne.'],
+  ru: ['Конечно.', 'Понимаю.', 'Хорошо.'],
+  ar: ['بالتأكيد.', 'فهمت.', 'حسنًا.'],
 }
 
 // VAD / timing
 const FRAME_BYTES   = 160
-// End-of-turn silence: lowered 800→500ms so the AI starts answering sooner
-// (snappier perceived latency). Tunable via AI_SILENCE_MS.
-const SILENCE_MS    = parseInt(process.env.AI_SILENCE_MS || '500', 10)
+// End-of-turn silence before the AI takes its turn. 500ms cut callers off
+// mid-thought ("didn't wait for the answer"); 700ms lets them finish while the
+// instant filler keeps it feeling responsive. Tunable via AI_SILENCE_MS.
+const SILENCE_MS    = parseInt(process.env.AI_SILENCE_MS || '700', 10)
 const MIN_SPEECH_MS = 300
 const MAX_UTTER_MS  = 15000
 const VAD_RMS       = parseInt(process.env.AI_VAD_RMS || '500', 10)
@@ -291,22 +296,27 @@ class AiCall {
       `Sen ${hotel} çağrı merkezinde telefonda görüşen ${this.agentName} adlı bir sesli asistansın.` +
       ` TEMEL KURAL: Arayan kişi hangi dilde konuşuyorsa SEN DE O DİLDE yanıt ver — dil değiştirme, sadece eşleştir.` +
       ` Türkçe, İngilizce, Almanca, Rusça ve Arapça konuşabilirsin.` +
-      ` Yanıtlarını kısa ve net tut; fiyat ya da oda tiplerini sayarken madde madde, tek tek belirt.` +
       ` Rezervasyon, oda, olanak, konum, fiyat ve ulaşım sorularında yardımcı ol.` +
       ` Kesin bilmediğin konuları uydurma; bir yetkiliye bağlamayı öner. Sıcak ve doğal konuş.`
 
-    // Conversation flow — always appended so the AI runs a warm, human flow:
-    // greet → get the caller's NAME (then use it) → ask how they are & respond
-    // kindly → naturally take a PHONE number → light small talk → present info
-    // with a nice lead-in. This also covers the brief data/STT/LLM wait time.
+    // Dialogue discipline — the two reported problems were: the AI didn't WAIT
+    // for answers (it monologued several things in one turn), and it ignored the
+    // caller's own questions to push its script. These rules enforce real
+    // call-center turn-taking: ONE thing per turn, then stop and listen; always
+    // answer the caller's question FIRST.
     const convoBlock =
-      `\n\n=== GÖRÜŞME AKIŞI (doğal, sıcak, insancıl) ===` +
-      `\n1) Sıcak selamla ve kendini "${this.agentName}" olarak tanıt.` +
-      `\n2) İLK İŞ: arayanın adını kibarca öğren ("Memnun oldum, adınızı öğrenebilir miyim?"). Adı öğrendikten sonra konuşma boyunca ismiyle hitap et (örn. "Ahmet Bey", "Ayşe Hanım").` +
-      `\n3) Kısaca nasıl olduğunu sor ("Nasılsınız, bugün size nasıl yardımcı olabilirim?"). Cevabına göre KİBARCA karşılık ver: iyiyse sevincini paylaş, yorgun/keyifsizse nazik ve anlayışlı ol.` +
-      `\n4) Uygun bir anda, size özel teklif/bilgi iletebilmek için telefon numarasını rica et ("Size özel bir teklif hazırlayıp iletebilmem için telefon numaranızı alabilir miyim?"). Numarayı tekrar ederek doğrula.` +
-      `\n5) Bilgileri verirken robotik olma; kısa, samimi bir girişle başla ("Tabii efendim, hemen ileteyim..."). Sonra oda tiplerini/fiyatları/olanakları net ve düzenli anlat.` +
-      `\n6) Konuşmayı doğal tut; tek seferde çok soru sorma, karşılıklı sohbet et. Telefonda olduğun için cümlelerini kısa ve akıcı kur.`
+      `\n\n=== KONUŞMA DÜZENİ (telefon görüşmesi — ÇOK ÖNEMLİ) ===` +
+      `\n• SIRAYLA konuş: her turda SADECE tek bir cümle söyle VEYA tek bir soru sor, sonra SUS ve karşının cevabını BEKLE. Aynı anda iki soru sorma; soru sorup arkasından başka konuya/soruya GEÇME.` +
+      `\n• Karşı taraf bir soru sorarsa ya da konu açarsa: ÖNCE buna kısa ve net cevap ver. Kendi sıranı (isim/telefon vb.) sonra, uygun olunca sürdür. Misafirin sorusu HER ZAMAN önceliklidir; kendi senaryona körü körüne bağlı kalma.` +
+      `\n• Cevapların KISA olsun (1-2 cümle). Sadece oda tiplerini/fiyatları sayarken biraz uzayabilirsin; o zaman madde madde, tek tek belirt.` +
+      `\n• Daha önce söylediğini tekrarlama; konuşmayı ilerlet.` +
+      `\n\nDOĞAL AKIŞ (çağrı boyunca, her turda SADECE BİR adım; karşının cevabını alıp öyle devam et):` +
+      `\n1) Selam ver + kendini "${this.agentName}" olarak tanıt → DUR, bekle.` +
+      `\n2) Adını kibarca sor → DUR, cevabını bekle. Öğrenince boyunca ismiyle hitap et ("Ahmet Bey", "Ayşe Hanım").` +
+      `\n3) Nasıl olduğunu/nasıl yardımcı olabileceğini sor → DUR, dinle. Cevabına göre kibarca karşılık ver.` +
+      `\n4) Talebini anla ve cevapla (oda, fiyat, olanak...). Misafir ne sorduysa ONU yanıtla.` +
+      `\n5) Uygun bir anda, teklif iletebilmek için telefon numarasını rica et → tekrar ederek doğrula.` +
+      `\n6) Kapanışta nazikçe teşekkür et.`
     this.systemPrompt = basePrompt + convoBlock + priceBlock + hotelBlock
 
     // Filler ("buying time") phrases — pre-synthesized so the AI acknowledges
