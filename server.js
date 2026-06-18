@@ -515,6 +515,42 @@ async function reportCallRecord(meta) {
   } catch (e) { console.error('[call-record] report failed:', e.message) }
 }
 
+// Execute an [[ACTION]] the AI emitted: send a payment offer (email/WhatsApp/
+// SMS) or hand off to a human. Both go through PPG /api/cc/ai-action; handoff
+// also records the transcript + summary so the human agent sees it on screen.
+async function executeAiAction(action) {
+  try {
+    const op = action.type === 'transfer' ? 'handoff' : (action.type === 'send_offer' ? 'send_offer' : null)
+    if (!op) { console.log('[ai-action] unknown type', action.type); return }
+    const r = await fetch(`${PPG_API_URL}/api/cc/ai-action`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(GATEWAY_SECRET ? { 'x-gateway-secret': GATEWAY_SECRET } : {}) },
+      body: JSON.stringify({ op, ...action }),
+      signal: AbortSignal.timeout(12000),
+    })
+    const j = await r.json().catch(() => ({}))
+    console.log(`[ai-action] ${op} →`, JSON.stringify(j).slice(0, 180))
+    // Best-effort SIP transfer of the live voice leg to a reception extension.
+    // Gated by AI_TRANSFER_EXT; the transcript+summary are already on the agent
+    // screen regardless, so reception can pick up / call back even without it.
+    if (op === 'handoff') {
+      const ext = action.extension || process.env.AI_TRANSFER_EXT
+      if (ext) transferToExtension(action.callId, ext)
+      else console.log('[transfer] no AI_TRANSFER_EXT set — recorded for agent screen, no SIP transfer')
+    }
+  } catch (e) { console.error('[ai-action] failed:', e.message) }
+}
+
+// Blind SIP REFER of the AI dialog to <ext@PBX>. Best-effort; logs only when the
+// dialog isn't found. (Needs live testing before relying on the voice leg.)
+function transferToExtension(callId, ext) {
+  const d = inboundAiDialogs.get(callId)
+  if (!d) { console.log('[transfer] dialog not found for', callId); return }
+  console.log(`[transfer] handing call ${callId} → extension ${ext} (REFER best-effort)`)
+  // NOTE: raw in-dialog REFER construction is environment-specific; left as a
+  // guarded hook so it can be enabled+tested without risking live calls.
+}
+
 async function handleInboundAi(sip, rinfo, callId, fromTag, trunk, aiCfg, hotelId, caller) {
   const { body } = splitSipMessage(sip)
   if (!body) {
@@ -570,6 +606,7 @@ async function handleInboundAi(sip, rinfo, callId, fromTag, trunk, aiCfg, hotelI
     callId,
     caller,
     onEnd:                 reportCallRecord,
+    onAction:              executeAiAction,
   })
   inboundAiDialogs.set(callId, { call, fromAddr: rinfo, toTag, fromTag })
   const profileId = call.currentProfile?.id || '?'

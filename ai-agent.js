@@ -256,7 +256,7 @@ class AiCall {
    * @param {object}  [opts.priceContext]          — { today, currency, roomTypes[], concepts[], prices[] }
    * @param {object}  [opts.hotelInfo]             — { name, city, country, stars, concept, website, amenities[], kb[] }
    */
-  constructor({ remoteIp, remotePort, onBye, greetingOverride, agentName, voiceProfiles, defaultVoiceProfileId, priceContext, hotelInfo, hotelId, callId, caller, onEnd } = {}) {
+  constructor({ remoteIp, remotePort, onBye, greetingOverride, agentName, voiceProfiles, defaultVoiceProfileId, priceContext, hotelInfo, hotelId, callId, caller, onEnd, onAction } = {}) {
     this.remoteIp   = remoteIp
     this.remotePort = remotePort
     this.onBye      = onBye
@@ -265,6 +265,7 @@ class AiCall {
     this.callId     = callId || null
     this.caller     = caller || null
     this.onEnd      = onEnd || null
+    this.onAction   = onAction || null   // executes [[ACTION {...}]] directives (offer/transfer)
     this.startedAt  = Date.now()
     this._reported  = false
 
@@ -314,7 +315,17 @@ class AiCall {
       `\n\nİNSANA AKTARIM: Şu durumlarda inisiyatif alma; "Size daha iyi yardımcı olabilmesi için sizi konunun uzmanı arkadaşıma aktarıyorum, lütfen kısa süre hatta kalın" deyip aktar: misafir sinirli/argo/çok gergin; açıkça "insana/müşteri temsilcisine bağla" derse; düğün, toplantı salonu, 5+ oda grup talebi; üst üste 2 kez anlayamazsan; sisteme ulaşılamayıp anlık fiyat çekilemezse.` +
 
       `\n\nBEKLEME: Sistemden veri çekerken misafiri sessiz bırakma; "Hemen sistemden kontrol ediyorum, lütfen hatta kalın" gibi kısa dolgu cümlesi kullan. Sıcak ve doğal konuş.`
-    this.systemPrompt = basePrompt + priceBlock + hotelBlock
+
+    // Action directives — the AI triggers real system actions by emitting ONE
+    // machine line at the VERY END of its reply. The gateway executes it and
+    // strips it from speech (it is never read aloud).
+    const actionBlock =
+      `\n\n=== SİSTEM AKSİYONLARI (sesli okunmaz, yalnız sistem için) ===` +
+      `\nBir aksiyon gerektiğinde, cevabının EN SONUNA tek satır olarak şu formatta yaz (kullanıcıya bundan bahsetme, normal cümleyle de söyle):` +
+      `\n• Ödeme linki gönderme (misafir kabul edip iletişim verince): [[ACTION {"type":"send_offer","channel":"email","guestName":"<ad>","guestEmail":"<e-posta>","guestPhone":"<telefon>","room":"<oda tipi>","total":<sayı>,"currency":"<EUR|TRY>","checkIn":"<YYYY-AA-GG>","checkOut":"<YYYY-AA-GG>","adults":<sayı>}]]  (channel: email | whatsapp; e-posta için email iste, WhatsApp için telefon yeterli)` +
+      `\n• İnsana/dahiliyeye aktarma (öfke, "insana bağla", grup/5+ oda/düğün/toplantı, 2 kez anlamama, sistem arızası): [[ACTION {"type":"transfer"}]]` +
+      `\nKURAL: total ve currency'yi MUTLAKA verdiğin fiyattan al; uydurma. E-posta yoksa channel=whatsapp kullan. Aksiyon satırını yalnız gerçekten gerektiğinde ekle.`
+    this.systemPrompt = basePrompt + priceBlock + hotelBlock + actionBlock
 
     // Filler ("buying time") phrases — pre-synthesized so the AI acknowledges
     // instantly the moment the caller stops talking, covering STT+LLM latency.
@@ -487,11 +498,20 @@ class AiCall {
       // caller hears the first words seconds earlier. shouldStop aborts on
       // hang-up or barge-in (caller starts talking over the AI).
       const stop = () => this.closed || this.cancelResponse
-      const reply = await llmStream(this.history, (sentence) => this.say(sentence), stop)
+      // Speak each sentence but NEVER read an [[ACTION ...]] directive aloud —
+      // strip from the first "[[" onward (directives are emitted last).
+      const speakClean = (sentence) => {
+        const spoken = sentence.includes('[[') ? sentence.slice(0, sentence.indexOf('[[')).trim() : sentence
+        if (spoken) this.say(spoken)
+      }
+      const reply = await llmStream(this.history, speakClean, stop)
       LOG('LLM:', JSON.stringify(reply))
       if (this.closed) { this.busy = false; return }
       if (reply) {
-        this.history.push({ role: 'assistant', content: reply })
+        // Store the clean (spoken) reply in history; execute any action directive.
+        const clean = reply.replace(/\[\[ACTION[\s\S]*?\]\]/g, '').trim()
+        this.history.push({ role: 'assistant', content: clean || reply })
+        this.runActions(reply)
       } else if (!this.cancelResponse) {
         await this.say('Anlayamadım, tekrar eder misiniz?')
       }
@@ -500,6 +520,27 @@ class AiCall {
       try { await this.say('Bir sorun oluştu, lütfen tekrar söyler misiniz?') } catch {}
     }
     this.busy = false
+  }
+
+  /** Parse [[ACTION {json}]] directives from the raw reply and dispatch them. */
+  runActions(rawReply) {
+    if (!this.onAction) return
+    const re = /\[\[ACTION\s*(\{[\s\S]*?\})\s*\]\]/g
+    let m
+    while ((m = re.exec(rawReply)) !== null) {
+      let action
+      try { action = JSON.parse(m[1]) } catch { LOG('bad action json:', m[1]); continue }
+      LOG('ACTION:', JSON.stringify(action))
+      try {
+        this.onAction({
+          ...action,
+          hotelId: this.hotelId,
+          callId: this.callId,
+          caller: this.caller,
+          transcript: (this.history || []).filter(t => t.role !== 'system'),
+        })
+      } catch (e) { LOG('action dispatch err', e.message) }
+    }
   }
 
   // Non-blocking: kicks off TTS fetch immediately (parallel with previous sentences
