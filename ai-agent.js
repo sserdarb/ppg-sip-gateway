@@ -125,7 +125,11 @@ async function groqTranscribe(ulawFrames) {
     body: form, signal: AbortSignal.timeout(15000),
   })
   const j = await r.json().catch(() => ({}))
-  return { text: (j.text || '').trim(), language: (j.language || '').toLowerCase().slice(0, 2) }
+  // Groq returns the language as a full name ("Turkish"/"English"); map to the
+  // 2-letter whisperCode the voice profiles use (else it'd become "tu", "en"…).
+  const LANG_MAP = { turkish: 'tr', english: 'en', german: 'de', russian: 'ru', arabic: 'ar' }
+  const raw = (j.language || '').toLowerCase()
+  return { text: (j.text || '').trim(), language: LANG_MAP[raw] || raw.slice(0, 2) }
 }
 
 /** STT dispatcher: Groq (fast) when configured, else self-hosted Whisper.
