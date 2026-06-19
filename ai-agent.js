@@ -107,6 +107,39 @@ async function whisperTranscribe(ulawFrames) {
   return { text: (j.text || '').trim(), language: (j.language || '').toLowerCase() }
 }
 
+const GROQ_API_KEY = process.env.GROQ_API_KEY || ''
+const GROQ_STT_MODEL = process.env.GROQ_STT_MODEL || 'whisper-large-v3-turbo'
+
+/** Groq STT — ultra-fast cloud Whisper. ~1s vs ~20s self-hosted on a loaded
+ *  host. Used automatically when GROQ_API_KEY is set; falls back to local. */
+async function groqTranscribe(ulawFrames) {
+  const pcm = Buffer.alloc(ulawFrames.length * 2)
+  for (let i = 0; i < ulawFrames.length; i++) pcm.writeInt16LE(ulawByteToPcm(ulawFrames[i]), i * 2)
+  const wav = pcm16ToWav(pcm, 8000)
+  const form = new FormData()
+  form.append('file', new Blob([wav], { type: 'audio/wav' }), 'a.wav')
+  form.append('model', GROQ_STT_MODEL)
+  form.append('response_format', 'verbose_json') // includes detected language
+  const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+    method: 'POST', headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
+    body: form, signal: AbortSignal.timeout(15000),
+  })
+  const j = await r.json().catch(() => ({}))
+  return { text: (j.text || '').trim(), language: (j.language || '').toLowerCase().slice(0, 2) }
+}
+
+/** STT dispatcher: Groq (fast) when configured, else self-hosted Whisper.
+ *  Falls back to Whisper if Groq errors so a key issue never kills the call. */
+async function transcribe(ulawFrames) {
+  if (GROQ_API_KEY) {
+    try {
+      const g = await groqTranscribe(ulawFrames)
+      if (g.text) return g
+    } catch (e) { LOG('groq stt err, falling back to whisper:', e.message) }
+  }
+  return whisperTranscribe(ulawFrames)
+}
+
 // Emit each COMPLETE sentence from `pending` via onSentence(); return leftover.
 async function emitSentences(pending, onSentence, shouldStop) {
   let out = pending
@@ -490,7 +523,7 @@ class AiCall {
     // real utterances (≥1s) so a quick "evet/tamam" doesn't trigger it.
     if (ms >= 1000) this.playFiller()
     try {
-      const { text, language } = await whisperTranscribe(audio)
+      const { text, language } = await transcribe(audio)
       LOG('STT:', JSON.stringify(text), 'lang:', language)
       if (!text || this.closed) { this.busy = false; return }
       // Switch voice to match caller's language (gender preserved)

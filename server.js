@@ -541,14 +541,38 @@ async function executeAiAction(action) {
   } catch (e) { console.error('[ai-action] failed:', e.message) }
 }
 
-// Blind SIP REFER of the AI dialog to <ext@PBX>. Best-effort; logs only when the
-// dialog isn't found. (Needs live testing before relying on the voice leg.)
+// In-dialog SIP REFER → transfer the live AI call to a reception extension.
+// As the answering UAS, From=invite-To(+our toTag), To=invite-From(+caller tag).
+// Best-effort: gated by AI_TRANSFER_EXT; the transcript+summary already reached
+// the agent screen regardless. Needs live testing to confirm the PBX accepts it.
 function transferToExtension(callId, ext) {
   const d = inboundAiDialogs.get(callId)
-  if (!d) { console.log('[transfer] dialog not found for', callId); return }
-  console.log(`[transfer] handing call ${callId} → extension ${ext} (REFER best-effort)`)
-  // NOTE: raw in-dialog REFER construction is environment-specific; left as a
-  // guarded hook so it can be enabled+tested without risking live calls.
+  if (!d || !d.inviteFrom) { console.log('[transfer] no dialog context for', callId); return }
+  const host = d.reqUriHost || PBX_HOST || d.fromAddr.address
+  const addTag = (hdr, tag) => /;tag=/i.test(hdr) ? hdr : `${hdr};tag=${tag}`
+  const fromLine = addTag(d.inviteTo, d.toTag)     // we are the To-party of the INVITE
+  const toLine = d.inviteFrom                        // caller already carries its own tag
+  const branch = 'z9hG4bK' + crypto.randomBytes(6).toString('hex')
+  const cseq = d.cseq || 2
+  d.cseq = cseq + 1
+  const refer = [
+    `REFER sip:${ext}@${host} SIP/2.0`,
+    `Via: SIP/2.0/UDP ${GATEWAY_HOST}:${UDP_PORT};branch=${branch}`,
+    `Max-Forwards: 70`,
+    `From: ${fromLine}`,
+    `To: ${toLine}`,
+    `Call-ID: ${d.callIdHdr}`,
+    `CSeq: ${cseq} REFER`,
+    `Contact: <sip:ai@${GATEWAY_HOST}:${UDP_PORT};transport=udp>`,
+    `Refer-To: <sip:${ext}@${host}>`,
+    `Referred-By: <sip:ai@${GATEWAY_HOST}>`,
+    `Content-Length: 0`,
+    '', '',
+  ].join('\r\n')
+  try {
+    udp.send(Buffer.from(refer), d.fromAddr.port, d.fromAddr.address)
+    console.log(`[transfer] REFER sent: call ${callId} → ${ext}@${host}`)
+  } catch (e) { console.error('[transfer] REFER send failed:', e.message) }
 }
 
 async function handleInboundAi(sip, rinfo, callId, fromTag, trunk, aiCfg, hotelId, caller) {
@@ -608,7 +632,12 @@ async function handleInboundAi(sip, rinfo, callId, fromTag, trunk, aiCfg, hotelI
     onEnd:                 reportCallRecord,
     onAction:              executeAiAction,
   })
-  inboundAiDialogs.set(callId, { call, fromAddr: rinfo, toTag, fromTag })
+  // Capture dialog context for a possible in-dialog REFER (live transfer).
+  const reqUriHost = (sip.split('\r\n')[0].match(/sips?:[^@\s]+@([^;>\s]+)/i) || [])[1] || pbxIp
+  const inviteFrom = extractHeader(sip, 'From')
+  const inviteTo = extractHeader(sip, 'To')
+  const callIdHdr = (sip.match(/^Call-ID:\s*([^\r\n]+)/im)?.[1] || callId).trim()
+  inboundAiDialogs.set(callId, { call, fromAddr: rinfo, toTag, fromTag, inviteFrom, inviteTo, callIdHdr, reqUriHost, cseq: 2 })
   const profileId = call.currentProfile?.id || '?'
   console.log(`[inbound:ai] answered ${callId} — PBX ${pbxIp}:${pbxPort} ↔ AI :${AI_RTP_PORT} agent=${call.agentName} profile=${profileId}`)
 }
