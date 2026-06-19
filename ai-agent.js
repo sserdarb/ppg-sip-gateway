@@ -47,12 +47,14 @@ const BUILTIN_PROFILES = [
 // fit any turn (chat or lookup) and just signal "I'm with you" while the reply
 // is generated. Kept generic on purpose ("checking the system" sounds wrong
 // when the caller just said their name).
+// Large, varied pools — picked randomly and only occasionally (STT is now ~0.4s
+// with Groq, so fillers are rarely needed; rotating 3 phrases sounded repetitive).
 const FILLERS = {
-  tr: ['Tabii efendim.', 'Anladım.', 'Peki efendim.'],
-  en: ['Of course.', 'I see.', 'Sure.'],
-  de: ['Natürlich.', 'Verstehe.', 'Gerne.'],
-  ru: ['Конечно.', 'Понимаю.', 'Хорошо.'],
-  ar: ['بالتأكيد.', 'فهمت.', 'حسنًا.'],
+  tr: ['Tabii efendim.', 'Hemen bakıyorum.', 'Bir saniye lütfen.', 'Elbette.', 'Memnuniyetle.', 'Tabii ki.', 'Hemen kontrol ediyorum.', 'Şöyle bakalım.'],
+  en: ['Of course.', 'One moment please.', 'Let me check.', 'Certainly.', 'Right away.', 'Sure thing.', 'Let me see.'],
+  de: ['Natürlich.', 'Einen Moment bitte.', 'Ich schaue gleich.', 'Gerne.', 'Sofort.', 'Mal sehen.'],
+  ru: ['Конечно.', 'Минутку, пожалуйста.', 'Сейчас посмотрю.', 'С удовольствием.', 'Один момент.'],
+  ar: ['بالتأكيد.', 'لحظة من فضلك.', 'سأتحقق حالًا.', 'بكل سرور.', 'حالًا.'],
 }
 
 // VAD / timing
@@ -364,7 +366,39 @@ class AiCall {
       `\n• Ödeme linki gönderme (misafir kabul edip iletişim verince): [[ACTION {"type":"send_offer","channel":"email","guestName":"<ad>","guestEmail":"<e-posta>","guestPhone":"<telefon>","room":"<oda tipi>","total":<sayı>,"currency":"<EUR|TRY>","checkIn":"<YYYY-AA-GG>","checkOut":"<YYYY-AA-GG>","adults":<sayı>}]]  (channel: email | whatsapp; e-posta için email iste, WhatsApp için telefon yeterli)` +
       `\n• İnsana/dahiliyeye aktarma (öfke, "insana bağla", grup/5+ oda/düğün/toplantı, 2 kez anlamama, sistem arızası): [[ACTION {"type":"transfer"}]]` +
       `\nKURAL: total ve currency'yi MUTLAKA verdiğin fiyattan al; uydurma. E-posta yoksa channel=whatsapp kullan. Aksiyon satırını yalnız gerçekten gerektiğinde ekle.`
-    this.systemPrompt = basePrompt + priceBlock + hotelBlock + actionBlock
+
+    // Conversation playbook — 30+ natural patterns the AI draws from based on
+    // what the caller says. NEVER repeat the same phrasing; improvise around
+    // these, don't read them verbatim. Keeps the call human + corporate.
+    const playbookBlock =
+      `\n\n=== DOĞAL KONUŞMA İLKELERİ ===` +
+      `\n- ASLA aynı kalıbı/aynı kelimeleri tekrarlama. Her cevabı farklı kur. "Anladım", "Tabii" gibi onayları arka arkaya kullanma; çeşitlendir veya hiç kullanma, doğrudan konuya gir.` +
+      `\n- Kurumsal ama samimi, akıcı ve doğal konuş; ezbere/robotik olma. Aşağıdaki kalıplar SADECE ilham; kelimesi kelimesine okuma, kendi cümlelerinle doğaçla.` +
+      `\n- Misafirin söylediğine göre uygun kalıbı seç. Kısa tut, sonra soruyu karşıya bırak.` +
+      `\n\n=== DİYALOG KALIPLARI (ilham — çeşitlendir) ===` +
+      `\n[Karşılama] "…'a hoş geldiniz, ben ${this.agentName}." / "Bugün size nasıl yardımcı olabilirim?" / "Hoş geldiniz, sizi dinliyorum."` +
+      `\n[İsim alma] "Öncelikle adınızı öğrenebilir miyim?" / "Kiminle görüşüyorum acaba?" / "Size nasıl hitap edeyim?"` +
+      `\n[Hal hatır] "Nasılsınız bugün?" / "Umarım gününüz güzel geçiyordur." / (kötüyse) "Geçmiş olsun, umarım kısa sürede toparlarsınız."` +
+      `\n[Tarih/kişi öğrenme] "Hangi tarihler için düşünüyorsunuz?" / "Kaç gece ve kaç kişi konaklayacaksınız?" / "Giriş ve çıkış tarihiniz nedir?"` +
+      `\n[Fiyat sunma] "… oda tipimiz, … konseptiyle gecelik … TL'den başlıyor." / "Bu tarihler için en uygun seçeneğimiz şu…" / "Size birkaç alternatif vereyim…"` +
+      `\n[Oda tipleri] "Standart, Aile, Deluxe ve Suit seçeneklerimiz var; hangisi ilginizi çeker?" / "Deniz manzaralı odalarımız da mevcut." / "Kaç kişilik bir oda arıyorsunuz?"` +
+      `\n[Oda özelliği] "Odalarımızda klima, mini bar, balkon ve ücretsiz Wi-Fi bulunur." / "… m² genişliğinde, … manzaralı."` +
+      `\n[Konsept/pansiyon] "Her Şey Dahil konseptimizde tüm öğünler ve seçili içecekler dahildir." / "Ultra Her Şey Dahil'de à la carte restoranlar da kapsamda."` +
+      `\n[Konum] "Otelimiz … bölgesinde, plaja sıfır." / "Havaalanına yaklaşık … dakika mesafedeyiz." / "Şehir merkezine … km uzaktayız."` +
+      `\n[Ulaşım/transfer] "Havaalanı transferi düzenleyebiliyoruz, ister misiniz?" / "Özel araçla geliyorsanız ücretsiz otoparkımız var."` +
+      `\n[Plaj/havuz] "Özel plajımız ve … havuzumuz mevcut." / "Aquapark ve çocuk havuzumuz da var."` +
+      `\n[Çocuk] "Çocuk kulübümüz … yaş arası misafirlerimize hizmet veriyor." / "… yaşına kadar çocuklar ücretsiz konaklıyor."` +
+      `\n[Spa/wellness] "Spa merkezimizde hamam, sauna ve masaj hizmetleri var." / "Fitness salonumuz 24 saat açık."` +
+      `\n[Yeme-içme] "Ana restoranımız açık büfe; ayrıca à la carte restoranlarımız mevcut." / "Özel beslenme/diyet talebinizi not edebiliriz."` +
+      `\n[Müsaitlik] "Bu tarihlerde müsaitliğimiz var, hemen ayırtabiliriz." / (yoksa) "O tarihler dolu görünüyor; çok yakın bir tarihe alternatif bakayım mı?"` +
+      `\n[Ek satış] "Çok küçük bir farkla deniz manzaralı odaya geçebilirsiniz, ister misiniz?" / "Balayı paketimiz de mevcut."` +
+      `\n[Teklif/ödeme] "Size özel teklifi telefonunuza/e-postanıza ödeme linkiyle gönderebilirim." / "Linkten güvenle ödeyince rezervasyonunuz kesinleşir."` +
+      `\n[Teyit] "Özetleyeyim: … tarihleri, … kişi, … oda, toplam … TL. Onaylıyor musunuz?"` +
+      `\n[İtiraz/pahalı] "Anlıyorum; daha uygun bir oda tipi ya da farklı tarih önerebilirim." / "Erken rezervasyon avantajımız olabilir, kontrol edeyim."` +
+      `\n[Şikayet] "Bu durumu yaşadığınız için üzgünüm, hemen ilgileniyorum." / "Sizi anlıyorum, en kısa sürede çözelim."` +
+      `\n[Bilmediğinde] "Bu detayı kesinleştirmem için bir yetkiliye aktarayım." / "Emin olmak adına ilgili arkadaşıma bağlıyorum."` +
+      `\n[Kapanış] "Başka yardımcı olabileceğim bir konu var mı?" / "Aradığınız için teşekkürler, iyi günler dilerim." / "Sizi otelimizde ağırlamak isteriz."`
+    this.systemPrompt = basePrompt + priceBlock + hotelBlock + playbookBlock + actionBlock
 
     // Filler ("buying time") phrases — pre-synthesized so the AI acknowledges
     // instantly the moment the caller stops talking, covering STT+LLM latency.
@@ -432,9 +466,13 @@ class AiCall {
    * cached, fetches in the background and warms for next time.
    */
   playFiller() {
-    const { lang, voice, whisperCode } = this.currentProfile
+    const { voice, whisperCode } = this.currentProfile
     const list = FILLERS[whisperCode] || FILLERS.tr
-    const text = list[this.fillerIdx++ % list.length]
+    // Random pick, never the same as last time → no repetition.
+    let idx = Math.floor(Math.random() * list.length)
+    if (list.length > 1 && idx === this._lastFiller) idx = (idx + 1) % list.length
+    this._lastFiller = idx
+    const text = list[idx]
     const cache = this.fillerCache.get(voice)
     const ulaw = cache && cache.get(text)
     if (ulaw) {
@@ -522,10 +560,10 @@ class AiCall {
     this.inSpeech = false; this.speechMs = 0; this.silenceMs = 0; this.utter = []
     if (ms < MIN_SPEECH_MS) return
     this.busy = true; this.cancelResponse = false
-    // The caller stopped talking → acknowledge INSTANTLY with a short filler
-    // ("bir saniye, kontrol ediyorum") that plays while STT+LLM run. Only for
-    // real utterances (≥1s) so a quick "evet/tamam" doesn't trigger it.
-    if (ms >= 1000) this.playFiller()
+    // Occasional, varied acknowledgement while STT+LLM run. STT is fast now
+    // (Groq ~0.4s) so fire RARELY (~30% of longer turns) and never the same
+    // phrase twice — avoids the repetitive "Anladım… Anladım…" feel.
+    if (ms >= 1200 && Math.random() < 0.3) this.playFiller()
     try {
       const { text, language } = await transcribe(audio)
       LOG('STT:', JSON.stringify(text), 'lang:', language)
