@@ -169,10 +169,16 @@ async function emitSentences(pending, onSentence, shouldStop) {
  * if the stream can't be opened.
  */
 async function llmStream(history, onSentence, shouldStop) {
-  const r = await fetch(`${NVIDIA_URL}/chat/completions`, {
+  // Prefer Groq (≈0.4s first token even with a large prompt) over NVIDIA
+  // (≈6.5s first token, which overran the timeout → "LLM timeout" on calls).
+  const useGroq = !!GROQ_API_KEY
+  const url = useGroq ? 'https://api.groq.com/openai/v1/chat/completions' : `${NVIDIA_URL}/chat/completions`
+  const key = useGroq ? GROQ_API_KEY : NVIDIA_KEY
+  const model = useGroq ? (process.env.GROQ_LLM_MODEL || 'llama-3.3-70b-versatile') : LLM_MODEL
+  const r = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${NVIDIA_KEY}` },
-    body: JSON.stringify({ model: LLM_MODEL, messages: history, temperature: 0.4, max_tokens: 220, stream: true }),
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+    body: JSON.stringify({ model, messages: history, temperature: 0.4, max_tokens: 220, stream: true }),
     signal: AbortSignal.timeout(20000),
   })
 
