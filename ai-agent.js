@@ -62,7 +62,9 @@ const FRAME_BYTES   = 160
 // instant filler keeps it feeling responsive. Tunable via AI_SILENCE_MS.
 const SILENCE_MS    = parseInt(process.env.AI_SILENCE_MS || '700', 10)
 const MIN_SPEECH_MS = 300
-const MAX_UTTER_MS  = 15000
+// Cap a single utterance so STT stays fast (Whisper on a loaded host is ~3x
+// realtime). 10s keeps transcription bounded. Tunable via AI_MAX_UTTER_MS.
+const MAX_UTTER_MS  = parseInt(process.env.AI_MAX_UTTER_MS || '10000', 10)
 const VAD_RMS       = parseInt(process.env.AI_VAD_RMS || '500', 10)
 // Barge-in (interrupting the AI WHILE it speaks) needs a louder + SUSTAINED
 // voice than normal capture — otherwise the AI's own echo on the phone bridge
@@ -100,7 +102,7 @@ async function whisperTranscribe(ulawFrames) {
   form.append('audio_file', new Blob([wav], { type: 'audio/wav' }), 'a.wav')
   // No language= param → Whisper auto-detects and returns it in response
   const url = `${WHISPER_URL}/asr?encode=true&task=transcribe&output=json`
-  const r = await fetch(url, { method: 'POST', body: form, signal: AbortSignal.timeout(20000) })
+  const r = await fetch(url, { method: 'POST', body: form, signal: AbortSignal.timeout(30000) })
   const j = await r.json().catch(() => ({}))
   return { text: (j.text || '').trim(), language: (j.language || '').toLowerCase() }
 }
