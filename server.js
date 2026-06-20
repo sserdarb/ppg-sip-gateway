@@ -19,6 +19,7 @@ const LOG_SIP       = process.env.LOG_SIP === '1'
 const RTPENGINE_HOST = process.env.RTPENGINE_HOST || ''   // empty = disabled
 const RTPENGINE_PORT = parseInt(process.env.RTPENGINE_PORT || '22222', 10)
 const PPG_API_URL    = (process.env.PPG_API_URL || 'https://ppg.pmapartner.com').replace(/\/$/, '')
+const AI_DEFAULT_HOTEL = process.env.AI_DEFAULT_HOTEL || '' // slug the 7000 extension represents (prices/offers)
 const GATEWAY_SECRET = process.env.GATEWAY_SECRET || ''
 
 // ── rtpengine client (optional — only used when host is configured) ─────────
@@ -389,11 +390,37 @@ class SipSession {
       body: browserSdp,
     }))
 
-    // 4) Start the voice agent (PCMU RTP via rtpengine ↔ Whisper/NVIDIA/Google-TTS).
-    const call = new AiCall({ remoteIp: rIp, remotePort: rPort })
+    // 4) Load the hotel's AI config (prices, hotel info, agent, offer capability)
+    //    so the direct AI extension behaves like a real DID call. Which hotel the
+    //    7000 extension represents is set via AI_DEFAULT_HOTEL (slug). Without it,
+    //    the agent runs generic (no prices/offers).
+    const caller = (extractHeader(sip, 'From').match(/sips?:(\+?[\d]+)@/i) || [])[1] || ''
+    let aiCfg = null, hotelId = null
+    if (AI_DEFAULT_HOTEL) {
+      try {
+        const url = `${PPG_API_URL}/api/cc/route?hotelSlug=${encodeURIComponent(AI_DEFAULT_HOTEL)}${caller ? `&caller=${encodeURIComponent(caller)}` : ''}`
+        const r = await fetch(url, { headers: GATEWAY_SECRET ? { 'x-gateway-secret': GATEWAY_SECRET } : {}, signal: AbortSignal.timeout(6000) })
+        const j = await r.json()
+        if (j?.found) { aiCfg = j.ai; hotelId = j.hotelId }
+      } catch (e) { console.error('[ai] config fetch failed:', e.message) }
+    }
+
+    // 5) Start the voice agent (PCMU RTP via rtpengine ↔ STT/LLM/TTS).
+    const call = new AiCall({
+      remoteIp: rIp, remotePort: rPort,
+      greetingOverride:      aiCfg?.greeting || undefined,
+      agentName:             aiCfg?.agentName || undefined,
+      voiceProfiles:         aiCfg?.voiceProfiles || undefined,
+      defaultVoiceProfileId: aiCfg?.defaultVoiceProfileId || undefined,
+      priceContext:          aiCfg?.priceContext || undefined,
+      hotelInfo:             aiCfg?.hotelInfo || undefined,
+      hotelId, callId, caller,
+      onEnd:                 reportCallRecord,
+      onAction:              executeAiAction,
+    })
     aiDialogs.set(callId, call)
     this.callIds.add(callId)
-    console.log(`[ai] answered ${AI_EXT} (call ${callId}) → media to ${rIp}:${rPort}`)
+    console.log(`[ai] answered ${AI_EXT} (call ${callId}) hotel=${AI_DEFAULT_HOTEL || 'generic'} → media to ${rIp}:${rPort}`)
   }
 
   sendToClient(msg) {
