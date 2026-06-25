@@ -37,6 +37,10 @@ const BUILTIN_PROFILES = [
   { id: 'male-de',   name: 'Hans',   gender: 'male',   lang: 'de-DE', whisperCode: 'de', voice: 'de-DE-Wavenet-B' },
   { id: 'female-ru', name: 'Наташа', gender: 'female', lang: 'ru-RU', whisperCode: 'ru', voice: 'ru-RU-Wavenet-A' },
   { id: 'male-ru',   name: 'Иван',   gender: 'male',   lang: 'ru-RU', whisperCode: 'ru', voice: 'ru-RU-Wavenet-B' },
+  { id: 'female-sv', name: 'Maja',   gender: 'female', lang: 'sv-SE', whisperCode: 'sv', voice: 'sv-SE-Wavenet-A' },
+  { id: 'male-sv',   name: 'Erik',   gender: 'male',   lang: 'sv-SE', whisperCode: 'sv', voice: 'sv-SE-Wavenet-B' },
+  { id: 'female-fr', name: 'Claire', gender: 'female', lang: 'fr-FR', whisperCode: 'fr', voice: 'fr-FR-Wavenet-A' },
+  { id: 'male-fr',   name: 'Pierre', gender: 'male',   lang: 'fr-FR', whisperCode: 'fr', voice: 'fr-FR-Wavenet-B' },
   { id: 'female-ar', name: 'نور',    gender: 'female', lang: 'ar-XA', whisperCode: 'ar', voice: 'ar-XA-Wavenet-A' },
   { id: 'male-ar',   name: 'عمر',    gender: 'male',   lang: 'ar-XA', whisperCode: 'ar', voice: 'ar-XA-Wavenet-B' },
 ]
@@ -55,6 +59,8 @@ const FILLERS = {
   de: ['Natürlich.', 'Einen Moment bitte.', 'Ich schaue gleich.', 'Gerne.', 'Sofort.', 'Mal sehen.'],
   ru: ['Конечно.', 'Минутку, пожалуйста.', 'Сейчас посмотрю.', 'С удовольствием.', 'Один момент.'],
   ar: ['بالتأكيد.', 'لحظة من فضلك.', 'سأتحقق حالًا.', 'بكل سرور.', 'حالًا.'],
+  sv: ['Självklart.', 'Ett ögonblick.', 'Jag kollar genast.', 'Visst.', 'Strax.'],
+  fr: ['Bien sûr.', 'Un moment, s\'il vous plaît.', 'Je vérifie.', 'Certainement.', 'Tout de suite.'],
 }
 
 // VAD / timing
