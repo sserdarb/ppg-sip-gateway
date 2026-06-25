@@ -17,7 +17,7 @@ const AI_EXT      = process.env.AI_EXTENSION || '7000'
 const AI_RTP_PORT = parseInt(process.env.AI_RTP_PORT || '5071', 10)
 const PUBLIC_IP   = process.env.AI_RTP_IP || detectIp()
 const WHISPER_URL = (process.env.WHISPER_URL || 'http://161.97.132.250:9009').replace(/\/$/, '')
-const TTS_KEY     = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY || ''
+const TTS_KEY     = process.env.GOOGLE_TTS_KEY || process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY || ''
 const NVIDIA_KEY  = process.env.NVIDIA_API_KEY || ''
 const NVIDIA_URL  = (process.env.NVIDIA_BASE_URL || 'https://integrate.api.nvidia.com/v1').replace(/\/$/, '')
 const LLM_MODEL   = process.env.AI_LLM_MODEL || 'meta/llama-3.3-70b-instruct'
@@ -268,14 +268,14 @@ async function llmStream(history, onSentence, shouldStop) {
 }
 
 // ── TTS ──────────────────────────────────────────────────────────────────────
-// Groq PlayAI TTS voice map: Google voice name → { model, voice }
-// Only for languages Groq PlayAI supports natively (EN, AR).
+// Groq Orpheus TTS voice map: Google voice name → { model, voice }
+// Requires terms acceptance at console.groq.com for each model.
 // TR/DE/RU always go to Google TTS; EN/AR try Groq first then fall back to Google.
 const GROQ_VOICE_MAP = {
-  'en-US-Wavenet-F': { model: 'playai-tts',        voice: 'Celeste-PlayAI'  },  // female-en Sophie
-  'en-US-Wavenet-D': { model: 'playai-tts',        voice: 'Fritz-PlayAI'    },  // male-en James
-  'ar-XA-Wavenet-A': { model: 'playai-tts-arabic', voice: 'Aaliya-PlayAI'   },  // female-ar نور
-  'ar-XA-Wavenet-B': { model: 'playai-tts-arabic', voice: 'Nasser-PlayAI'   },  // male-ar عمر
+  'en-US-Wavenet-F': { model: 'canopylabs/orpheus-v1-english',    voice: 'tara'   },  // female-en
+  'en-US-Wavenet-D': { model: 'canopylabs/orpheus-v1-english',    voice: 'leo'    },  // male-en
+  'ar-XA-Wavenet-A': { model: 'canopylabs/orpheus-arabic-saudi',  voice: 'nour'   },  // female-ar
+  'ar-XA-Wavenet-B': { model: 'canopylabs/orpheus-arabic-saudi',  voice: 'hamdan' },  // male-ar
 }
 
 /** Groq PlayAI TTS → MULAW 8kHz raw bytes.
