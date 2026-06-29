@@ -626,7 +626,7 @@ class AiCall {
     // LOUDER, SUSTAINED voice counts as a real barge-in; anything else is
     // ignored so the AI never cuts itself off on echo/noise.
     if (this.speaking || this._pendingTts > 0 || this.busy) {
-      if (rms > BARGE_RMS) {
+      if (this.speaking && rms > BARGE_RMS) {
         this.bargeMs += 20
         if (this.bargeMs >= BARGE_MIN_MS) {
           this.playQueue.length = 0

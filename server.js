@@ -22,6 +22,17 @@ const PPG_API_URL    = (process.env.PPG_API_URL || 'https://ppg.pmapartner.com')
 const AI_DEFAULT_HOTEL = process.env.AI_DEFAULT_HOTEL || '' // slug the 7000 extension represents (prices/offers)
 const GATEWAY_SECRET = process.env.GATEWAY_SECRET || ''
 
+// Helper to route requests internally to avoid hairpin NAT loopback timeouts on the VPS
+async function apiFetch(url, options = {}) {
+  let targetUrl = url;
+  const headers = { ...(options.headers || {}) };
+  if (targetUrl.includes('ppg.pmapartner.com')) {
+    targetUrl = targetUrl.replace('https://ppg.pmapartner.com', 'http://coolify-proxy');
+    headers['Host'] = 'ppg.pmapartner.com';
+  }
+  return fetch(targetUrl, { ...options, headers });
+}
+
 // ── rtpengine client (optional — only used when host is configured) ─────────
 const rtpengine = RTPENGINE_HOST
   ? new RtpEngineClient(RTPENGINE_HOST, RTPENGINE_PORT)
@@ -399,7 +410,7 @@ class SipSession {
     if (AI_DEFAULT_HOTEL) {
       try {
         const url = `${PPG_API_URL}/api/cc/route?hotelSlug=${encodeURIComponent(AI_DEFAULT_HOTEL)}${caller ? `&caller=${encodeURIComponent(caller)}` : ''}`
-        const r = await fetch(url, { headers: GATEWAY_SECRET ? { 'x-gateway-secret': GATEWAY_SECRET } : {}, signal: AbortSignal.timeout(6000) })
+        const r = await apiFetch(url, { headers: GATEWAY_SECRET ? { 'x-gateway-secret': GATEWAY_SECRET } : {}, signal: AbortSignal.timeout(6000) })
         const j = await r.json()
         if (j?.found) { aiCfg = j.ai; hotelId = j.hotelId }
       } catch (e) { console.error('[ai] config fetch failed:', e.message) }
@@ -490,7 +501,7 @@ async function handleInboundInvite(sip, rinfo) {
   try {
     const url = `${PPG_API_URL}/api/cc/route?did=${encodeURIComponent(did)}${caller ? `&caller=${encodeURIComponent(caller)}` : ''}`
     const fetchHeaders = GATEWAY_SECRET ? { 'x-gateway-secret': GATEWAY_SECRET } : {}
-    const r = await fetch(url, { headers: fetchHeaders, signal: AbortSignal.timeout(6000) })
+    const r = await apiFetch(url, { headers: fetchHeaders, signal: AbortSignal.timeout(6000) })
     routeInfo = await r.json()
   } catch (e) {
     console.error('[inbound] PPG lookup failed:', e.message)
@@ -532,7 +543,7 @@ async function handleInboundInvite(sip, rinfo) {
 async function reportCallRecord(meta) {
   try {
     if (!meta || !meta.hotelId) return
-    await fetch(`${PPG_API_URL}/api/cc/call-record`, {
+    await apiFetch(`${PPG_API_URL}/api/cc/call-record`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...(GATEWAY_SECRET ? { 'x-gateway-secret': GATEWAY_SECRET } : {}) },
       body: JSON.stringify(meta),
@@ -549,7 +560,7 @@ async function executeAiAction(action) {
   try {
     const op = action.type === 'transfer' ? 'handoff' : (action.type === 'send_offer' ? 'send_offer' : null)
     if (!op) { console.log('[ai-action] unknown type', action.type); return }
-    const r = await fetch(`${PPG_API_URL}/api/cc/ai-action`, {
+    const r = await apiFetch(`${PPG_API_URL}/api/cc/ai-action`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...(GATEWAY_SECRET ? { 'x-gateway-secret': GATEWAY_SECRET } : {}) },
       body: JSON.stringify({ op, ...action }),
