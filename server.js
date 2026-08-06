@@ -46,6 +46,7 @@ if (rtpengine) {
 
 // ── AI voice concierge: answers calls to AI_EXT locally (no PBX forward) ─────
 const { AiCall, AI_EXT, AI_RTP_PORT, PUBLIC_IP: AI_PUBLIC } = require('./ai-agent')
+const { providerStatus } = require('./providers')
 const aiDialogs = new Map()  // Call-ID → AiCall (active AI calls)
 console.log(`[ai] voice concierge enabled for extension ${AI_EXT} (rtp ${AI_PUBLIC}:${AI_RTP_PORT})`)
 
@@ -133,6 +134,10 @@ const httpServer = http.createServer((req, res) => {
       totalToClient,
       pbx: `${PBX_HOST}:${PBX_PORT}/udp`,
       gateway: `${GATEWAY_HOST}:${UDP_PORT}`,
+      activeAiCalls: inboundAiDialogs.size + aiDialogs.size,
+      // Which STT/TTS/LLM providers actually have credentials right now — the
+      // first thing to check when the AI "can't hear" or "won't speak".
+      providers: providerStatus(),
     }))
     return
   }
@@ -425,9 +430,12 @@ class SipSession {
       defaultVoiceProfileId: aiCfg?.defaultVoiceProfileId || undefined,
       priceContext:          aiCfg?.priceContext || undefined,
       hotelInfo:             aiCfg?.hotelInfo || undefined,
+      sttVocabulary:         aiCfg?.sttVocabulary || undefined,
+      fewShot:               aiCfg?.fewShot || undefined,
       hotelId, callId, caller,
       onEnd:                 reportCallRecord,
       onAction:              executeAiAction,
+      onTool:                checkAvailability,
     })
     aiDialogs.set(callId, call)
     this.callIds.add(callId)
@@ -553,6 +561,49 @@ async function reportCallRecord(meta) {
   } catch (e) { console.error('[call-record] report failed:', e.message) }
 }
 
+/**
+ * The AI's live lookup tool. The caller is on the line waiting, so this is a
+ * SYNCHRONOUS request/response (unlike the fire-and-forget actions below): PPG
+ * answers with the real rooms + prices for the requested dates and the agent
+ * speaks that result. Returning null makes the agent apologise and hand off
+ * rather than invent availability.
+ */
+async function checkAvailability(call) {
+  const started = Date.now()
+  try {
+    if (!call?.hotelId) return null
+    const r = await apiFetch(`${PPG_API_URL}/api/cc/availability`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(GATEWAY_SECRET ? { 'x-gateway-secret': GATEWAY_SECRET } : {}) },
+      body: JSON.stringify({
+        hotelId: call.hotelId,
+        checkIn: call.checkIn,
+        checkOut: call.checkOut,
+        adults: call.adults,
+        children: call.children,
+        childAges: call.childAges,
+        caller: call.caller,
+      }),
+      // The caller hears a "checking the system" filler during this window —
+      // keep it well under the point where the line feels dead.
+      signal: AbortSignal.timeout(8000),
+    })
+    const j = await r.json().catch(() => null)
+    console.log(`[tool] check_availability ${call.checkIn}→${call.checkOut} (${Date.now() - started}ms) →`, JSON.stringify(j).slice(0, 220))
+    return j && j.ok ? j.result : null
+  } catch (e) {
+    console.error('[tool] check_availability failed:', e.message)
+    return null
+  }
+}
+
+// Which extension each department answers on. Set as JSON, e.g.
+//   AI_TRANSFER_EXT_MAP={"reception":"100","sales":"200","reservation":"300"}
+// Falls back to AI_TRANSFER_EXT for any department without its own entry.
+let TRANSFER_EXT_MAP = {}
+try { TRANSFER_EXT_MAP = JSON.parse(process.env.AI_TRANSFER_EXT_MAP || '{}') }
+catch { console.error('[transfer] AI_TRANSFER_EXT_MAP is not valid JSON — ignored') }
+
 // Execute an [[ACTION]] the AI emitted: send a payment offer (email/WhatsApp/
 // SMS) or hand off to a human. Both go through PPG /api/cc/ai-action; handoff
 // also records the transcript + summary so the human agent sees it on screen.
@@ -572,9 +623,14 @@ async function executeAiAction(action) {
     // Gated by AI_TRANSFER_EXT; the transcript+summary are already on the agent
     // screen regardless, so reception can pick up / call back even without it.
     if (op === 'handoff') {
-      const ext = action.extension || process.env.AI_TRANSFER_EXT
-      if (ext) transferToExtension(action.callId, ext)
-      else console.log('[transfer] no AI_TRANSFER_EXT set — recorded for agent screen, no SIP transfer')
+      const dept = (action.department || '').toLowerCase()
+      const ext = action.extension || TRANSFER_EXT_MAP[dept] || process.env.AI_TRANSFER_EXT
+      if (ext) {
+        console.log(`[transfer] department=${dept || 'default'} → ext ${ext}`)
+        transferToExtension(action.callId, ext)
+      } else {
+        console.log('[transfer] no extension for this department and no AI_TRANSFER_EXT — recorded for agent screen, no SIP transfer')
+      }
     }
   } catch (e) { console.error('[ai-action] failed:', e.message) }
 }
@@ -664,11 +720,14 @@ async function handleInboundAi(sip, rinfo, callId, fromTag, trunk, aiCfg, hotelI
     defaultVoiceProfileId: aiCfg?.defaultVoiceProfileId || undefined,
     priceContext:          aiCfg?.priceContext   || undefined,
     hotelInfo:             aiCfg?.hotelInfo      || undefined,
+    sttVocabulary:         aiCfg?.sttVocabulary  || undefined,
+    fewShot:               aiCfg?.fewShot        || undefined,
     hotelId,
     callId,
     caller,
     onEnd:                 reportCallRecord,
     onAction:              executeAiAction,
+    onTool:                checkAvailability,
   })
   // Capture dialog context for a possible in-dialog REFER (live transfer).
   const reqUriHost = (sip.split('\r\n')[0].match(/sips?:[^@\s]+@([^;>\s]+)/i) || [])[1] || pbxIp
