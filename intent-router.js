@@ -38,14 +38,36 @@ const SYSTEM_PROMPT =
   `# ÇIKTI FORMATI (yalnızca geçerli JSON)\n` +
   `{"intent":"RESERVATION_NEW","confidence":0.95,"summary_key":"2 yetişkin 1 çocuk için Temmuz ayı fiyat sorgusu"}`
 
+// Turkish letters are not \w in JavaScript, so \b cannot be trusted here.
+// LEFT boundary only: a pattern must start a word, but Turkish suffixes may
+// follow it ("fiyat" still matches "fiyatlarınız", "müsait" matches
+// "müsaitliğiniz"). Without this, short tokens matched INSIDE longer words —
+// "gece" fired on "gecen sefer" and misrouted a complaint to RESERVATION_NEW.
+const TR_LETTER = 'a-zçğıöşüâîû'
+const startsWord = (body) => new RegExp(`(?<![${TR_LETTER}])(?:${body})`, 'i')
+
 // Unambiguous surface patterns — free and instant. Order matters: escalation
 // beats everything else, because a caller asking for a human while also asking
 // a price is still an escalation.
 const RULES = [
-  { intent: 'COMPLAINT_URGENT', confidence: 0.95, re: /(insana|müşteri temsilcis|yetkili|müdür|şikayet|rezalet|berbat|dava|iade etmiyor|çok pahalı|indirim yapın|pazarlık)/i },
-  { intent: 'RESERVATION_EXISTING', confidence: 0.9, re: /(rezervasyonumu|rezervasyonum var|iptal et|değiştir|erteley|konfirme|voucher|kaydım|pnr)/i },
-  { intent: 'RESERVATION_NEW', confidence: 0.85, re: /(fiyat|ne kadar|kaç para|müsait|boş oda|boş yer|rezervasyon yaptır|konaklama|gece|kişilik oda)/i },
-  { intent: 'HOTEL_INFO', confidence: 0.85, re: /(nerede|konum|adres|transfer|havaalan|evcil|köpek|kedi|konsept|her şey dahil|herşey dahil|plaj|havuz|check.?in|check.?out|giriş saat|çıkış saat|otopark|wifi|spa)/i },
+  {
+    intent: 'COMPLAINT_URGENT', confidence: 0.95,
+    re: startsWord('insana|müşteri temsilcis|yetkili|müdür|şikayet|rezalet|berbat|dava(?![' + TR_LETTER + '])|iade etmiyor|çok pahalı|indirim yapın|pazarlık|sorun yaşa|memnun kalmad|geri ödeme'),
+  },
+  {
+    intent: 'RESERVATION_EXISTING', confidence: 0.9,
+    re: startsWord('rezervasyonumu|rezervasyonum var|iptal et|değiştir|erteley|konfirme|voucher|kaydım|pnr(?![' + TR_LETTER + '])'),
+  },
+  {
+    intent: 'RESERVATION_NEW', confidence: 0.85,
+    // "gece" needs a RIGHT boundary too ("gecen"≠"gece"), so the useful
+    // inflections are spelled out instead of relying on a prefix match.
+    re: startsWord('fiyat|ne kadar|kaç para|müsait|boş oda|boş yer|rezervasyon yaptır|konaklama|gece(?![' + TR_LETTER + '])|gecelik|geceleme|kişilik oda'),
+  },
+  {
+    intent: 'HOTEL_INFO', confidence: 0.85,
+    re: startsWord('nerede|konum|adres|transfer|havaalan|havaliman|evcil|köpek|kedi|konsept|her şey dahil|herşey dahil|plaj|havuz|check.?in|check.?out|giriş saat|çıkış saat|otopark|wifi|spa(?![' + TR_LETTER + '])'),
+  },
 ]
 
 /** Free pre-classifier. Returns null when nothing matches confidently. */
