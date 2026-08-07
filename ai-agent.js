@@ -673,11 +673,19 @@ class AiCall {
     this._toolInFlight = false
     if (this.closed || this.cancelResponse) return true
 
+    // The contract behind this tool publishes prices and stop-sale but not
+    // always room COUNTS. When it doesn't (stockDataAvailable=false) the agent
+    // may quote the rate but must NOT promise a room — "empty" is not "zero",
+    // and a guaranteed booking the hotel can't honour is worse than a callback.
+    const stockUnknown = result && result.dataAvailable && result.stockDataAvailable === false
     this.history.push({
       role: 'system',
       content: result
         ? `MÜSAİTLİK SORGU SONUCU (sistemden geldi, GERÇEK veri — sadece bunu kullan):\n${JSON.stringify(result)}\n` +
-          `Bu sonucu misafire 1-2 cümleyle, sesli okunacak biçimde aktar. Boş oda yoksa pozitif çerçeveleyip alternatif tarih öner. Fiyatı UYDURMA; sonuçta yoksa kesin fiyat verme.`
+          `Bu sonucu misafire 1-2 cümleyle, sesli okunacak biçimde aktar. Fiyatı UYDURMA; sonuçta yoksa kesin fiyat verme.` +
+          (stockUnknown
+            ? ` DİKKAT: oda ADEDİ bilgisi yok. Fiyatı söyleyebilirsin ama "kesin yeriniz var / ayırdım" DEME; "fiyatımız şu, uygunsa hemen teyit ettirelim" gibi kur.`
+            : ` Boş oda yoksa pozitif çerçeveleyip alternatif tarih öner.`)
         : `MÜSAİTLİK SORGUSU BAŞARISIZ: sisteme ulaşılamadı. Misafire fiyat/müsaitlik UYDURMA; kısa bir özür ile bir yetkiliye aktaracağını söyle ve transfer aksiyonunu çalıştır.`,
     })
 
