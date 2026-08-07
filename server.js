@@ -590,7 +590,27 @@ async function checkAvailability(call) {
     })
     const j = await r.json().catch(() => null)
     console.log(`[tool] check_availability ${call.checkIn}→${call.checkOut} (${Date.now() - started}ms) →`, JSON.stringify(j).slice(0, 220))
-    return j && j.ok ? j.result : null
+    if (!j || !j.ok) return null
+    const res = j.result
+
+    // SAFETY NET — never let the agent tell a caller the hotel is full on the
+    // strength of missing data. The call-center contract publishes prices and
+    // stop-sale but no room counts, so a server that reads a 0 count as "no
+    // rooms" reports EVERY room sold out for EVERY date. PPG marks a
+    // stock-aware answer with `stockDataAvailable`; its absence means the
+    // server has no stock semantics at all, and a blanket sold-out from such a
+    // server is unknown, not full. Returning null makes the agent apologise
+    // and hand off to a human — the honest outcome.
+    const blanketSoldOut = res && res.dataAvailable
+      && res.anyAvailable === false
+      && res.stockDataAvailable === undefined
+      && Array.isArray(res.unavailable) && res.unavailable.length > 0
+      && res.unavailable.every(u => u && u.reason === 'sold-out')
+    if (blanketSoldOut) {
+      console.warn('[tool] blanket sold-out with no stock semantics — treating as UNKNOWN, handing off')
+      return null
+    }
+    return res
   } catch (e) {
     console.error('[tool] check_availability failed:', e.message)
     return null
