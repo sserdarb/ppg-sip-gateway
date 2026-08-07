@@ -116,7 +116,8 @@ function buildPriceBlock(pc) {
   const today = (pc && pc.today) || new Date().toISOString().slice(0, 10)
   if (pc && Array.isArray(pc.roomTypes) && pc.roomTypes.length) {
     const priceLines = (pc.prices || [])
-      .map(p => `  - ${p.roomType} / ${p.concept}: ${p.from} ${p.currency}'dan başlayan gece fiyatı (geçerli: ${p.validFrom} → ${p.validTo})`)
+      .map(p => `  - ${p.roomType} / ${p.concept}: ${p.from} ${p.currency}'dan başlayan gece fiyatı (geçerli: ${p.validFrom} → ${p.validTo})` +
+        (p.converted ? ' (yaklaşık, kur çevrimi)' : ''))
       .join('\n')
     return (
       `\n\n=== FİYAT & ODA BİLGİSİ ===` +
@@ -126,6 +127,7 @@ function buildPriceBlock(pc) {
       (priceLines ? `\nGÜNCEL FİYAT LİSTESİ (gece başı):\n${priceLines}` : '') +
       `\nKURALLAR:` +
       `\n1) Müşteri fiyat sorduğunda mevcut oda tiplerini TEK TEK say ve her birinin konseptini (pansiyon) belirt.` +
+      `\n1b) Bir satırda "(yaklaşık, kur çevrimi)" yazıyorsa o oda diğer para biriminde sözleşmelidir: fiyatı "yaklaşık" diye sun ve kesin tutarı teyit ettireceğini söyle.` +
       `\n2) Fiyat vermeden önce giriş ve çıkış tarihini, yetişkin sayısını ve çocuk YAŞLARINI öğren.` +
       `\n3) Geçmiş bir tarih istenirse fiyat verme; "geçmiş tarih için fiyat veremiyorum, güncel tarihlerde yardımcı olayım" de.` +
       `\n4) Listede olmayan oda/tarih için fiyat UYDURMA; bir yetkiliye aktarmayı öner.` +
