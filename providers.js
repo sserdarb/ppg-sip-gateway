@@ -350,11 +350,22 @@ async function synthesize(text, profile) {
  * Order via AI_LLM_CHAIN (default "groq,cerebras,openrouter,nvidia").
  */
 const CEREBRAS_KEY = process.env.CEREBRAS_API_KEY || ''
-const CEREBRAS_MODEL = process.env.CEREBRAS_LLM_MODEL || 'llama-3.3-70b'
+// Valid ids on this account (GET /v1/models): gpt-oss-120b, zai-glm-4.7,
+// gemma-4-31b. Measured on the real call script: gpt-oss-120b at
+// reasoning_effort=low answers in ~520ms and passes every behavioural check
+// (fires the availability tool, one question per turn, no invented price);
+// gemma-4-31b returned empty output and zai-glm-4.7 spent its budget reasoning.
+const CEREBRAS_MODEL = process.env.CEREBRAS_LLM_MODEL || 'gpt-oss-120b'
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || ''
 const OPENROUTER_MODEL = process.env.OPENROUTER_LLM_MODEL || 'meta-llama/llama-3.3-70b-instruct'
 
-const LLM_ORDER = parseOrder(process.env.AI_LLM_CHAIN, 'groq,cerebras,openrouter,nvidia')
+// CEREBRAS FIRST, measured rather than assumed. Groq's free tier exhausts its
+// 100k tokens-per-day and then silently serves the 8B model, which on the real
+// call script reads bullet lists aloud and never fires the availability tool —
+// a fast wrong answer. Cerebras answers in ~520ms, passes every check, and has
+// its own quota. Groq stays second (it is faster when it has budget),
+// OpenRouter fourth (~2.2s and currently out of credits).
+const LLM_ORDER = parseOrder(process.env.AI_LLM_CHAIN, 'cerebras,groq,openrouter,nvidia')
 
 function llmChain() {
   const byVendor = {
@@ -368,10 +379,15 @@ function llmChain() {
       return out
     },
     // Cerebras is the latency star (~2000 tok/s) — a good primary for voice.
+    // NOTE: its gpt-oss / glm models are REASONING models: they stream
+    // `delta.reasoning` before any `delta.content`, so a 160-token budget is
+    // spent thinking and the caller hears nothing. Reasoning is wrong for a
+    // phone turn anyway (latency), so `reasoning_effort: low` is sent and a
+    // non-reasoning model is the default.
     cerebras: () => CEREBRAS_KEY ? [{
       name: `cerebras:${CEREBRAS_MODEL}`,
       url: 'https://api.cerebras.ai/v1/chat/completions',
-      key: CEREBRAS_KEY, model: CEREBRAS_MODEL,
+      key: CEREBRAS_KEY, model: CEREBRAS_MODEL, reasoningEffort: 'low',
     }] : [],
     openrouter: () => OPENROUTER_KEY ? [{
       name: `openrouter:${OPENROUTER_MODEL}`,
@@ -419,6 +435,7 @@ async function streamOnce(ep, messages, onSentence, shouldStop, opts) {
       // Two spoken sentences is ~60 tokens; the old 220 left room to ramble
       // into the 4-5 sentence answers heard on the test call.
       max_tokens: opts.maxTokens ?? 160,
+      ...(ep.reasoningEffort ? { reasoning_effort: ep.reasoningEffort } : {}),
       stream: true,
     }),
     signal: AbortSignal.timeout(opts.timeoutMs ?? 20000),

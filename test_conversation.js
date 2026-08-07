@@ -39,16 +39,29 @@ const FAKE_ROOMS = [/standart\s*oda/i, /comfort\s*club/i, /suit\b(?!\s*e)/i]
 // ("15 bin 500") are normalised before checking.
 const REAL_PRICES = PRICE_CONTEXT.prices.map(p => p.from)
 
+/**
+ * Prices are spoken, not written: "17 bin 20 TL" is 17.020, not 17.000. Reading
+ * the thousands word without its remainder made this harness report the agent's
+ * CORRECT quotes as hallucinations — a false alarm is as bad as a missed one.
+ */
 function spokenNumbers(text) {
   const out = []
-  // "15 bin 500" / "on beş bin" style and plain digits.
-  const re = /(\d[\d.,]*)\s*(bin)?/gi
+  // "17 bin 20" / "42 bin 750" / "15 bin" — thousands word plus optional remainder.
+  const withBin = /(\d[\d.]*)\s*bin(?:\s*(\d{1,3}))?/gi
   let m
-  while ((m = re.exec(text)) !== null) {
-    let n = parseFloat(m[1].replace(/\./g, '').replace(',', '.'))
-    if (!Number.isFinite(n)) continue
-    if (m[2]) n *= 1000
-    if (n >= 1000) out.push(Math.round(n))
+  const consumed = []
+  while ((m = withBin.exec(text)) !== null) {
+    const thousands = parseInt(m[1].replace(/\./g, ''), 10)
+    const rest = m[2] ? parseInt(m[2], 10) : 0
+    if (Number.isFinite(thousands)) out.push(thousands * 1000 + rest)
+    consumed.push([m.index, m.index + m[0].length])
+  }
+  // Plain written figures ("17.020 TL") outside any "bin" phrase.
+  const plain = /(\d[\d.]{3,})/g
+  while ((m = plain.exec(text)) !== null) {
+    if (consumed.some(([a, b]) => m.index >= a && m.index < b)) continue
+    const n = parseInt(m[1].replace(/\./g, ''), 10)
+    if (Number.isFinite(n) && n >= 1000) out.push(n)
   }
   return out
 }
