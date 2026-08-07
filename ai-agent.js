@@ -30,6 +30,33 @@ const PUBLIC_IP   = process.env.AI_RTP_IP || detectIp()
 const HOTEL       = process.env.AI_HOTEL_NAME || 'otelimiz'
 const LOG = (...a) => console.log('[ai]', ...a)
 
+// Voice upgrade / override.
+//
+// PPG ships the canonical profile list, which still names the classic WaveNet
+// voices. WaveNet is what made the agent sound mechanical on a real call, so
+// Turkish is remapped to Chirp3-HD (Google's generative tier, available on the
+// same key, 30 Turkish voices, ~200ms slower per sentence — hidden by
+// sentence-streaming).
+//
+// Overridable per profile id so a voice can be swapped after listening to
+// samples, without waiting on a PPG deploy:
+//   AI_VOICE_OVERRIDE={"female-tr":"tr-TR-Chirp3-HD-Kore","male-tr":"tr-TR-Chirp3-HD-Puck"}
+const DEFAULT_VOICE_OVERRIDE = {
+  'female-tr': process.env.AI_VOICE_TR_FEMALE || 'tr-TR-Chirp3-HD-Achernar',
+  'male-tr': process.env.AI_VOICE_TR_MALE || 'tr-TR-Chirp3-HD-Charon',
+}
+let VOICE_OVERRIDE = DEFAULT_VOICE_OVERRIDE
+try {
+  if (process.env.AI_VOICE_OVERRIDE) {
+    VOICE_OVERRIDE = { ...DEFAULT_VOICE_OVERRIDE, ...JSON.parse(process.env.AI_VOICE_OVERRIDE) }
+  }
+} catch { console.error('[ai] AI_VOICE_OVERRIDE is not valid JSON — using defaults') }
+
+/** Apply the override map to a profile list, leaving gender/name/lang intact. */
+function applyVoiceOverride(profiles) {
+  return profiles.map(p => (VOICE_OVERRIDE[p.id] ? { ...p, voice: VOICE_OVERRIDE[p.id] } : p))
+}
+
 // STT language handling:
 //   adaptive (default) — turn 1 auto-detects; once the SAME language comes back
 //                        twice in a row it is pinned for the rest of the call.
@@ -221,9 +248,10 @@ class AiCall {
     this.startedAt  = Date.now()
     this._reported  = false
 
-    // Resolve voice profiles
-    this.profiles = (Array.isArray(voiceProfiles) && voiceProfiles.length)
-      ? voiceProfiles : BUILTIN_PROFILES
+    // Resolve voice profiles, then upgrade/override the synthesis voice.
+    this.profiles = applyVoiceOverride(
+      (Array.isArray(voiceProfiles) && voiceProfiles.length) ? voiceProfiles : BUILTIN_PROFILES,
+    )
     const defId = defaultVoiceProfileId || 'female-tr'
     this.currentProfile = this.profiles.find(p => p.id === defId) || this.profiles[0]
     // Lock the operator-selected gender — language auto-switch keeps this gender
@@ -316,8 +344,10 @@ class AiCall {
       // Voice-channel rules. These exist because text-tuned models write lists
       // and long paragraphs, which are unlistenable on a phone line.
       `\n\n=== SESLİ İLETİŞİM İÇİN OPTİMİZE EDİLMİŞ TEMEL PRENSİPLER ===` +
-      `\n1) KISA VE NET OL: Yanıtın EN FAZLA 1-2 cümle olsun. Asla uzun liste okuma, madde madde sayma, tablo tarif etme.` +
-      `\n2) SORU-CEVAP DÖNGÜSÜ: Her yanıtının sonunda konuşmayı ilerletecek TEK bir net soru sor, sonra SUS ve cevabı BEKLE. Aynı anda iki soru sorma.` +
+      // The test call produced 4-5 sentence answers stacking two questions.
+      // On a phone line the caller loses the thread and interrupts.
+      `\n1) KISA VE NET OL: Yanıtın EN FAZLA 2 cümle olsun — bu KESİN bir sınır, 3. cümleyi yazma. Asla uzun liste okuma, oda tiplerini arka arkaya sayma, tablo tarif etme. Misafir "hepsini say" derse bile en fazla iki seçenek söyle, sonra "devam edeyim mi?" diye sor.` +
+      `\n2) SORU-CEVAP DÖNGÜSÜ: Her yanıtının sonunda TEK bir net soru sor, sonra SUS ve cevabı BEKLE. Aynı anda iki soru sorma — tarih ve kişi sayısını AYRI turlarda öğren.` +
       `\n3) DOĞAL DİL: "Efendim", "Memnuniyetle", "Tarihlerinizi kontrol ediyorum" gibi kurumsal ama sıcak ifadeler kullan.` +
       `\n4) RAKAMLAR: Fiyatları ve tarihleri sesli okunacak şekilde yaz — "15.000 TL" değil "on beş bin TL", "2 kişi" değil "iki yetişkin".` +
       `\n5) Misafir kendi sorusunu sorarsa ÖNCE ona cevap ver, kendi sıranı sonra sürdür. Söylediğini tekrarlama.` +
@@ -332,7 +362,14 @@ class AiCall {
       `\n- Bilgin olmayan konularda uydurma yapma: "Sizi hemen resepsiyon yetkilimize aktarıyorum, lütfen hatta kalın." de ve aktarım aksiyonunu çalıştır.` +
 
       `\n\nKIRMIZI ÇİZGİLER:` +
-      `\n- Bilgi UYDURMA: bilgi bankasında/sistemde olmayan fiyat, kampanya veya özelliği söyleme.` +
+      // A live test call had the agent quote 15.500 TL and 17.500 TL for a room
+      // that is not priced in the contract at all. Nothing else in this prompt
+      // matters if the numbers are fiction, so the rule is stated as an
+      // absolute with no room for interpretation.
+      `\n- ⛔ FİYAT UYDURMAK EN AĞIR HATADIR. Sadece ve sadece "GÜNCEL FİYAT LİSTESİ"nde YAZAN ya da müsaitlik sorgusunun SANA DÖNDÜRDÜĞÜ rakamları söyleyebilirsin. Listede olmayan bir oda tipi için fiyat SÖYLEME, tahmin etme, yuvarlama, "civarında" deme. Aklından sayı üretme.` +
+      `\n- ⛔ Listede OLMAYAN oda tipini "var" gibi anlatma. Hangi oda tiplerinin satıldığı fiyat listesinde yazar; başka oda adı ICAT ETME.` +
+      `\n- ⛔ Müsaitlik sorgusu ÇALIŞMADAN "yerimiz var / müsaitiz / hemen ayırtabiliriz" DEME. Müsaitliği yalnızca sorgu sonucu söyleyebilir.` +
+      `\n- Bilgi UYDURMA: bilgi bankasında/sistemde olmayan kampanya veya özelliği söyleme.` +
       `\n- Kredi kartı numarası veya CVV'yi ASLA sesli isteme. Ödeme yalnızca misafirin telefonuna gönderilen güvenli ödeme linkiyle yapılır.` +
       `\n- Resepsiyon inisiyatifindeki konulara KESİN söz verme (örn. erken giriş): "talebinizi sisteme not alıyorum, giriş günü müsaitliğe göre arkadaşlarımız yardımcı olur" de.` +
       `\n- Rezervasyonu kesinleştirmeden ÖNCE giriş-çıkış tarihi, kişi sayısı ve toplam tutarı özetle ve sesli ONAY al ("Onaylıyor musunuz?").` +
@@ -350,27 +387,28 @@ class AiCall {
       `\n• İnsana/dahiliyeye aktarma: [[ACTION {"type":"transfer","department":"<reception|sales|reservation|manager>"}]]  — öfke/insan talebi/müdür → manager veya reception; grup, düğün, 5+ oda → sales; mevcut rezervasyon değişikliği → reservation.` +
       `\nKURAL: total ve currency'yi MUTLAKA verdiğin fiyattan al; uydurma. E-posta yoksa channel=whatsapp kullan. Aksiyon satırını yalnız gerçekten gerektiğinde ekle. Bir turda EN FAZLA bir aksiyon yaz.`
 
-    // Style rails so the model improvises instead of reciting.
+    // Style rails.
+    //
+    // There used to be a long "[Fiyat sunma] '… oda tipimiz, … konseptiyle
+    // gecelik … TL'den başlıyor.'"-style phrase book here, labelled "inspiration
+    // only". A live test call proved that framing does not survive contact with
+    // a model: it read the lines VERBATIM ("Bu tarihlerde müsaitliğimiz var,
+    // hemen ayırtabiliriz.") and, worse, FILLED IN THE BLANKS WITH INVENTED
+    // NUMBERS — quoting 15.500 TL and 17.500 TL for a room type that is not
+    // even priced in the contract. Templates with holes are an invitation to
+    // hallucinate, and reciting them is exactly what made the agent sound
+    // robotic and repetitive.
+    //
+    // So: no quotable sentences here at all. Tone is described as behaviour,
+    // and the actual phrasing is learned from the real-call few-shot pack
+    // below — complete exchanges with real wording, nothing to fill in.
     const playbookBlock =
-      `\n\n=== DOĞAL KONUŞMA İLKELERİ ===` +
-      `\n- ASLA aynı kalıbı/aynı kelimeleri tekrarlama. Her cevabı farklı kur. "Anladım", "Tabii" gibi onayları arka arkaya kullanma.` +
-      `\n- Kurumsal ama samimi, akıcı ve doğal konuş; ezbere/robotik olma. Aşağıdaki kalıplar SADECE ilham; kelimesi kelimesine okuma.` +
-      `\n\n=== DİYALOG KALIPLARI (ilham — çeşitlendir) ===` +
-      `\n[Karşılama] "…'a hoş geldiniz, ben ${this.agentName}." / "Bugün size nasıl yardımcı olabilirim?"` +
-      `\n[İsim alma] "Öncelikle adınızı öğrenebilir miyim?" / "Size nasıl hitap edeyim?"` +
-      `\n[Tarih/kişi öğrenme] "Hangi tarihler için düşünüyorsunuz?" / "Kaç gece ve kaç kişi konaklayacaksınız?" / "Çocuğunuz varsa yaşını alabilir miyim?"` +
-      `\n[Fiyat sunma] "… oda tipimiz, … konseptiyle gecelik … TL'den başlıyor." / "Bu tarihler için en uygun seçeneğimiz şu…"` +
-      `\n[Oda tipleri] "Standart, Aile, Deluxe ve Suit seçeneklerimiz var; hangisi ilginizi çeker?" / "Deniz manzaralı odalarımız da mevcut."` +
-      `\n[Konsept] "Her Şey Dahil konseptimizde tüm öğünler ve seçili içecekler dahildir." / "Ultra Her Şey Dahil'de à la carte restoranlar da kapsamda."` +
-      `\n[Konum/ulaşım] "Otelimiz … bölgesinde, plaja sıfır." / "Havaalanı transferi düzenleyebiliyoruz, ister misiniz?"` +
-      `\n[Müsaitlik] "Bu tarihlerde müsaitliğimiz var, hemen ayırtabiliriz." / (yoksa) "O tarihler dolu görünüyor; çok yakın bir tarihe alternatif bakayım mı?"` +
-      `\n[Ek satış] "Çok küçük bir farkla deniz manzaralı odaya geçebilirsiniz, ister misiniz?" / "Balayı paketimiz de mevcut."` +
-      `\n[Teklif/ödeme] "Size özel teklifi telefonunuza ödeme linkiyle gönderebilirim." / "Linkten güvenle ödeyince rezervasyonunuz kesinleşir."` +
-      `\n[Teyit] "Özetleyeyim: … tarihleri, … kişi, … oda, toplam … TL. Onaylıyor musunuz?"` +
-      `\n[İtiraz/pahalı] "Anlıyorum; daha uygun bir oda tipi ya da farklı tarih önerebilirim." / "Erken rezervasyon avantajımız olabilir, kontrol edeyim."` +
-      `\n[Şikayet] "Bu durumu yaşadığınız için üzgünüm, hemen ilgileniyorum." / "Sizi anlıyorum, en kısa sürede çözelim."` +
-      `\n[Bilmediğinde] "Bu detayı kesinleştirmem için bir yetkiliye aktarayım."` +
-      `\n[Kapanış] "Başka yardımcı olabileceğim bir konu var mı?" / "Sizi otelimizde ağırlamak isteriz."`
+      `\n\n=== NASIL KONUŞMALISIN ===` +
+      `\n- SICAK VE İNSANİ OL: karşındaki bir misafir, bir form değil. Söylediğine gerçekten tepki ver — tarih söylerse "ne güzel, yaz sonu çok sakin oluyor" gibi kısa ve içten bir şey; sorun anlatırsa önce üzüntünü belirt. Duygusuz bilgi aktarımı yapma.` +
+      `\n- KENDİ CÜMLELERİNİ KUR: ezberlenmiş kalıp okuma. Aynı şeyi iki kez söylemen gerekirse BAŞKA kelimelerle söyle.` +
+      `\n- TEKRARDAN KAÇIN: bu konuşmada daha önce kullandığın açılış/onay kelimelerini yeniden kullanma. "Tabii", "Anladım", "Elbette", "Memnuniyetle" gibi doldurma onayları peş peşe kullanma; çoğu zaman hiç kullanma, doğrudan konuya gir.` +
+      `\n- AKICI KONUŞ: yazı dili değil konuşma dili kullan. Kısa cümleler, doğal bağlaçlar. Madde işareti, liste, başlık, emoji YOK.` +
+      `\n- Misafirin adını öğrendiysen ara sıra kullan ("Ahmet Bey"), ama her cümlede değil.`
 
     // Real-call examples for THIS intent (falls back to the generic pack).
     const pack = this._fewShot

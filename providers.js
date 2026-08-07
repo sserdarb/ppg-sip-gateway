@@ -266,14 +266,33 @@ async function groqTts(text, { voiceName }) {
   return wavToUlaw(Buffer.from(await r.arrayBuffer()))
 }
 
-/** Google Cloud TTS — the always-available floor; asks for MULAW directly. */
+/**
+ * Google Cloud TTS — the always-available floor; asks for MULAW directly.
+ *
+ * Chirp3-HD is Google's generative tier and sounds far less mechanical than
+ * WaveNet, which is what made the agent read as robotic on the phone. It is
+ * available on the existing key (30 Turkish voices) and does emit MULAW 8kHz;
+ * it costs ~200ms more per sentence, which sentence-streaming hides.
+ *
+ * Caveat: Chirp3-HD REJECTS `pitch` ("does not support pitch parameters"), so
+ * prosody tuning is limited to speakingRate.
+ */
+const isChirp = (v) => /-Chirp\d?-?HD-/i.test(v || '')
+const SPEAKING_RATE = parseFloat(process.env.AI_TTS_SPEAKING_RATE || '1.0')
+
 async function googleTts(text, { lang, voiceName }) {
+  const audioConfig = { audioEncoding: 'MULAW', sampleRateHertz: 8000 }
+  if (SPEAKING_RATE && SPEAKING_RATE !== 1.0) audioConfig.speakingRate = SPEAKING_RATE
+  // pitch is only safe on the classic voices.
+  const pitch = parseFloat(process.env.AI_TTS_PITCH || '0')
+  if (pitch && !isChirp(voiceName)) audioConfig.pitch = pitch
+
   const r = await fetch(`https://texttospeech.googleapis.com/v1/text:synthesize?key=${GOOGLE_TTS_KEY}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       input: { text },
       voice: { languageCode: lang, name: voiceName },
-      audioConfig: { audioEncoding: 'MULAW', sampleRateHertz: 8000 },
+      audioConfig,
     }),
     signal: AbortSignal.timeout(15000),
   })
@@ -350,8 +369,17 @@ async function streamOnce(ep, messages, onSentence, shouldStop, opts) {
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ep.key}` },
     body: JSON.stringify({
       model: ep.model, messages,
-      temperature: opts.temperature ?? 0.4,
-      max_tokens: opts.maxTokens ?? 220,
+      // Live calls came back robotic and repetitive: the same acknowledgements
+      // ("Tabii", "Anladım") and the same sentence shapes every turn. 0.4 with
+      // no penalties makes a model settle into one groove and stay there.
+      // The penalties are what actually break the loop — temperature alone
+      // just adds noise, and too much of it invites invented facts.
+      temperature: opts.temperature ?? 0.65,
+      frequency_penalty: opts.frequencyPenalty ?? 0.5,   // stop reusing words
+      presence_penalty: opts.presencePenalty ?? 0.35,    // push toward new ground
+      // Two spoken sentences is ~60 tokens; the old 220 left room to ramble
+      // into the 4-5 sentence answers heard on the test call.
+      max_tokens: opts.maxTokens ?? 160,
       stream: true,
     }),
     signal: AbortSignal.timeout(opts.timeoutMs ?? 20000),

@@ -47,7 +47,23 @@ if (rtpengine) {
 // ── AI voice concierge: answers calls to AI_EXT locally (no PBX forward) ─────
 const { AiCall, AI_EXT, AI_RTP_PORT, PUBLIC_IP: AI_PUBLIC } = require('./ai-agent')
 const { providerStatus } = require('./providers')
-const aiDialogs = new Map()  // Call-ID → AiCall (active AI calls)
+// Call-ID → { call, toTag, answerSdp }. toTag + answerSdp are kept so a
+// session-timer refresh (in-dialog re-INVITE/UPDATE) can be answered in-dialog.
+const aiDialogs = new Map()
+
+/**
+ * Echo the peer's session timer back so it re-arms, naming the CALLER as the
+ * refresher. The AI leg is a UAS with no re-INVITE machinery of its own, so it
+ * must never accept the refresher role — it would silently stop refreshing and
+ * the call would drop exactly the way it did before this was handled.
+ */
+function sessionExpiresHeaders(sip) {
+  const se = (sip.match(/^Session-Expires:\s*([^\r\n]+)/im) || [])[1]
+  if (!se) return []
+  const seconds = (se.match(/^\s*(\d+)/) || [])[1]
+  if (!seconds) return []
+  return [`Session-Expires: ${seconds};refresher=uac`, 'Require: timer']
+}
 console.log(`[ai] voice concierge enabled for extension ${AI_EXT} (rtp ${AI_PUBLIC}:${AI_RTP_PORT})`)
 
 // ── Shared UDP socket to/from PBX ───────────────────────────────────────────
@@ -354,16 +370,42 @@ class SipSession {
     const method = reqM ? reqM[1].toUpperCase() : null
     const callId = (sip.match(/^Call-ID:\s*([^\r\n]+)/im)?.[1] || '').trim()
 
-    // In-dialog requests for an active AI call (ACK / BYE / CANCEL)
+    // In-dialog requests for an active AI call
     if (callId && aiDialogs.has(callId)) {
+      const d = aiDialogs.get(callId)
       if (method === 'BYE' || method === 'CANCEL') {
         this.sendToClient(this.buildResponse(sip, 200, 'OK'))
-        const call = aiDialogs.get(callId); aiDialogs.delete(callId)
-        try { call.close() } catch {}
+        aiDialogs.delete(callId)
+        try { d.call.close() } catch {}
         rtpengine.delete({ callId, fromTag: extractTag(extractHeader(sip, 'From')) }).catch(() => {})
         console.log(`[ai] call ${callId} ended (${method})`)
+        return true
       }
-      return true  // ACK absorbed; any other in-dialog msg swallowed
+      if (method === 'ACK') return true          // nothing to answer
+      // SESSION REFRESH. A session timer (RFC 4028) is refreshed with an
+      // in-dialog re-INVITE or UPDATE. These used to be swallowed with no
+      // reply, so the refresher timed out and tore the call down mid-sentence
+      // with `BYE ... cause=408 "Request Timeout"` — the caller heard the line
+      // simply die. Answer them, re-arming the timer.
+      if (method === 'INVITE' || method === 'UPDATE') {
+        const withSdp = method === 'INVITE' || /^Content-Type:\s*application\/sdp/im.test(sip)
+        this.sendToClient(this.buildResponse(sip, 200, 'OK', {
+          toTag: d.toTag,
+          extra: [
+            `Contact: <sip:${AI_EXT}@${GATEWAY_HOST}:${UDP_PORT};transport=udp>`,
+            ...sessionExpiresHeaders(sip),
+            ...(withSdp && d.answerSdp ? ['Content-Type: application/sdp'] : []),
+          ],
+          body: withSdp && d.answerSdp ? d.answerSdp : '',
+        }))
+        console.log(`[ai] session refresh ${method} answered for ${callId}`)
+        return true
+      }
+      if (method === 'OPTIONS' || method === 'INFO' || method === 'NOTIFY') {
+        this.sendToClient(this.buildResponse(sip, 200, 'OK', { toTag: d.toTag }))
+        return true
+      }
+      return true
     }
 
     // New INVITE to the AI extension → answer with the voice concierge
@@ -399,10 +441,15 @@ class SipSession {
     const browserSdp = ansRes?.sdp
     if (!browserSdp) { console.error('[ai] rtpengine answer failed'); this.sendToClient(this.buildResponse(sip, 500, 'Server Internal Error')); return }
 
-    // 3) 200 OK with the WebRTC answer.
+    // 3) 200 OK with the WebRTC answer. Session-Expires is echoed with
+    //    refresher=uac so the peer keeps the dialog alive (see the helper).
     this.sendToClient(this.buildResponse(sip, 200, 'OK', {
       toTag,
-      extra: [`Contact: <sip:${AI_EXT}@${GATEWAY_HOST}:${UDP_PORT};transport=udp>`, 'Content-Type: application/sdp'],
+      extra: [
+        `Contact: <sip:${AI_EXT}@${GATEWAY_HOST}:${UDP_PORT};transport=udp>`,
+        ...sessionExpiresHeaders(sip),
+        'Content-Type: application/sdp',
+      ],
       body: browserSdp,
     }))
 
@@ -437,7 +484,7 @@ class SipSession {
       onAction:              executeAiAction,
       onTool:                checkAvailability,
     })
-    aiDialogs.set(callId, call)
+    aiDialogs.set(callId, { call, toTag, answerSdp: browserSdp })
     this.callIds.add(callId)
     console.log(`[ai] answered ${AI_EXT} (call ${callId}) hotel=${AI_DEFAULT_HOTEL || 'generic'} → media to ${rIp}:${rPort}`)
   }
@@ -725,6 +772,7 @@ async function handleInboundAi(sip, rinfo, callId, fromTag, trunk, aiCfg, hotelI
     toTag,
     extra: [
       `Contact: <sip:ai@${GATEWAY_HOST}:${UDP_PORT};transport=udp>`,
+      ...sessionExpiresHeaders(sip),
       'Content-Type: application/sdp',
     ],
     body: aiSdp,
@@ -754,7 +802,7 @@ async function handleInboundAi(sip, rinfo, callId, fromTag, trunk, aiCfg, hotelI
   const inviteFrom = extractHeader(sip, 'From')
   const inviteTo = extractHeader(sip, 'To')
   const callIdHdr = (sip.match(/^Call-ID:\s*([^\r\n]+)/im)?.[1] || callId).trim()
-  inboundAiDialogs.set(callId, { call, fromAddr: rinfo, toTag, fromTag, inviteFrom, inviteTo, callIdHdr, reqUriHost, cseq: 2 })
+  inboundAiDialogs.set(callId, { call, fromAddr: rinfo, toTag, fromTag, inviteFrom, inviteTo, callIdHdr, reqUriHost, cseq: 2, answerSdp: aiSdp })
   const profileId = call.currentProfile?.id || '?'
   console.log(`[inbound:ai] answered ${callId} — PBX ${pbxIp}:${pbxPort} ↔ AI :${AI_RTP_PORT} agent=${call.agentName} profile=${profileId}`)
 }
@@ -775,6 +823,27 @@ function handleInboundAiDialog(sip, rinfo, callId) {
     if (dialog?.call) { try { dialog.call.close() } catch {} }
     inboundAiDialogs.delete(callId)
     console.log(`[inbound:ai] call ${callId} cancelled`)
+    return
+  }
+  // SESSION REFRESH (RFC 4028) — see sessionExpiresHeaders(). Left unanswered,
+  // the refresher tears the call down mid-sentence with cause=408.
+  if (/^(INVITE|UPDATE)\s/i.test(firstLine)) {
+    const isInvite = /^INVITE\s/i.test(firstLine)
+    const withSdp = isInvite || /^Content-Type:\s*application\/sdp/im.test(sip)
+    udp.send(Buffer.from(buildUdpResponse(sip, 200, 'OK', {
+      toTag: dialog?.toTag,
+      extra: [
+        `Contact: <sip:ai@${GATEWAY_HOST}:${UDP_PORT};transport=udp>`,
+        ...sessionExpiresHeaders(sip),
+        ...(withSdp && dialog?.answerSdp ? ['Content-Type: application/sdp'] : []),
+      ],
+      body: withSdp && dialog?.answerSdp ? dialog.answerSdp : '',
+    })), rinfo.port, rinfo.address)
+    console.log(`[inbound:ai] session refresh answered for ${callId}`)
+    return
+  }
+  if (/^(OPTIONS|INFO|NOTIFY)\s/i.test(firstLine)) {
+    udp.send(Buffer.from(buildUdpResponse(sip, 200, 'OK', { toTag: dialog?.toTag })), rinfo.port, rinfo.address)
   }
 }
 
