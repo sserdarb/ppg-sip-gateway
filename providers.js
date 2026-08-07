@@ -336,16 +336,55 @@ async function synthesize(text, profile) {
 //  LLM
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Ordered chat endpoints: Groq primary → Groq fallback model → NVIDIA. */
+/**
+ * Ordered chat endpoints.
+ *
+ * A single vendor is not enough for a phone line. Measured on the live key:
+ * Groq's free tier caps `llama-3.3-70b-versatile` at 100k TOKENS PER DAY, and
+ * once that is spent every call degrades — while the 8B fallback's entire
+ * per-minute budget (6k tokens) is smaller than one request, so it answers 413
+ * rather than helping. NVIDIA alone then times out at 20s.
+ *
+ * So the chain spans VENDORS, not just models: whoever still has budget answers
+ * the call. All four speak the OpenAI chat API, so they share one code path.
+ * Order via AI_LLM_CHAIN (default "groq,cerebras,openrouter,nvidia").
+ */
+const CEREBRAS_KEY = process.env.CEREBRAS_API_KEY || ''
+const CEREBRAS_MODEL = process.env.CEREBRAS_LLM_MODEL || 'llama-3.3-70b'
+const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || ''
+const OPENROUTER_MODEL = process.env.OPENROUTER_LLM_MODEL || 'meta-llama/llama-3.3-70b-instruct'
+
+const LLM_ORDER = parseOrder(process.env.AI_LLM_CHAIN, 'groq,cerebras,openrouter,nvidia')
+
 function llmChain() {
-  const chain = []
-  if (GROQ_API_KEY) {
-    chain.push({ name: `groq:${GROQ_LLM_MODEL}`, url: 'https://api.groq.com/openai/v1/chat/completions', key: GROQ_API_KEY, model: GROQ_LLM_MODEL })
-    if (GROQ_LLM_FALLBACK && GROQ_LLM_FALLBACK !== GROQ_LLM_MODEL)
-      chain.push({ name: `groq:${GROQ_LLM_FALLBACK}`, url: 'https://api.groq.com/openai/v1/chat/completions', key: GROQ_API_KEY, model: GROQ_LLM_FALLBACK })
+  const byVendor = {
+    groq: () => {
+      if (!GROQ_API_KEY) return []
+      const url = 'https://api.groq.com/openai/v1/chat/completions'
+      const out = [{ name: `groq:${GROQ_LLM_MODEL}`, url, key: GROQ_API_KEY, model: GROQ_LLM_MODEL }]
+      if (GROQ_LLM_FALLBACK && GROQ_LLM_FALLBACK !== GROQ_LLM_MODEL) {
+        out.push({ name: `groq:${GROQ_LLM_FALLBACK}`, url, key: GROQ_API_KEY, model: GROQ_LLM_FALLBACK })
+      }
+      return out
+    },
+    // Cerebras is the latency star (~2000 tok/s) — a good primary for voice.
+    cerebras: () => CEREBRAS_KEY ? [{
+      name: `cerebras:${CEREBRAS_MODEL}`,
+      url: 'https://api.cerebras.ai/v1/chat/completions',
+      key: CEREBRAS_KEY, model: CEREBRAS_MODEL,
+    }] : [],
+    openrouter: () => OPENROUTER_KEY ? [{
+      name: `openrouter:${OPENROUTER_MODEL}`,
+      url: 'https://openrouter.ai/api/v1/chat/completions',
+      key: OPENROUTER_KEY, model: OPENROUTER_MODEL,
+    }] : [],
+    nvidia: () => NVIDIA_KEY ? [{
+      name: `nvidia:${NVIDIA_LLM_MODEL}`,
+      url: `${NVIDIA_URL}/chat/completions`,
+      key: NVIDIA_KEY, model: NVIDIA_LLM_MODEL,
+    }] : [],
   }
-  if (NVIDIA_KEY) chain.push({ name: `nvidia:${NVIDIA_LLM_MODEL}`, url: `${NVIDIA_URL}/chat/completions`, key: NVIDIA_KEY, model: NVIDIA_LLM_MODEL })
-  return chain
+  return LLM_ORDER.flatMap(v => (byVendor[v] ? byVendor[v]() : []))
 }
 
 /** Emit each COMPLETE sentence from `pending` via onSentence(); return leftover. */
@@ -385,7 +424,13 @@ async function streamOnce(ep, messages, onSentence, shouldStop, opts) {
     signal: AbortSignal.timeout(opts.timeoutMs ?? 20000),
   })
 
-  if (!r.ok) throw new Error(`${ep.name} ${r.status}`)
+  if (!r.ok) {
+    // Carry the vendor's own words: "tokens per day (TPD): Limit 100000, Used
+    // 99637" is a completely different problem from "Request too large ... TPM",
+    // and a bare status code hides which one you are looking at.
+    const detail = (await r.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 220)
+    throw new Error(`${ep.name} ${r.status}${detail ? `: ${detail}` : ''}`)
+  }
 
   // Non-streaming body (some gateways ignore stream:true) — take it whole.
   if (!r.body || typeof r.body.getReader !== 'function') {

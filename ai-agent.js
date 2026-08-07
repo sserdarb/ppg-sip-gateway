@@ -139,57 +139,55 @@ LOG('providers:', JSON.stringify(providerStatus()))
 // Pricing rules. With a live priceContext the AI enumerates real options and
 // never quotes a past date. Without it, it still refuses past dates and won't
 // invent prices.
+const PRICE_ROW_CAP = parseInt(process.env.AI_PRICE_ROW_CAP || '8', 10)
+
 function buildPriceBlock(pc) {
   const today = (pc && pc.today) || new Date().toISOString().slice(0, 10)
   if (pc && Array.isArray(pc.roomTypes) && pc.roomTypes.length) {
     const priceLines = (pc.prices || [])
-      .map(p => `  - ${p.roomType} / ${p.concept}: ${p.from} ${p.currency}'dan başlayan gece fiyatı (geçerli: ${p.validFrom} → ${p.validTo})` +
-        (p.converted ? ' (yaklaşık, kur çevrimi)' : ''))
+      .slice(0, PRICE_ROW_CAP)
+      .map(p => `- ${p.roomType}/${p.concept}: ${p.from} ${p.currency}'dan (${p.validFrom}→${p.validTo})` +
+        (p.converted ? ' [yaklaşık, kur çevrimi]' : ''))
       .join('\n')
     return (
-      `\n\n=== FİYAT & ODA BİLGİSİ ===` +
-      `\nBUGÜNÜN TARİHİ: ${today}. Bu tarihten ÖNCEKİ hiçbir tarih için fiyat verme.` +
-      `\nODA TİPLERİ: ${pc.roomTypes.join(', ')}.` +
-      `\nKONSEPTLER: ${pc.concepts.join(', ')}.` +
-      (priceLines ? `\nGÜNCEL FİYAT LİSTESİ (gece başı):\n${priceLines}` : '') +
-      `\nKURALLAR:` +
-      `\n1) Müşteri fiyat sorduğunda mevcut oda tiplerini TEK TEK say ve her birinin konseptini (pansiyon) belirt.` +
-      `\n1b) Bir satırda "(yaklaşık, kur çevrimi)" yazıyorsa o oda diğer para biriminde sözleşmelidir: fiyatı "yaklaşık" diye sun ve kesin tutarı teyit ettireceğini söyle.` +
-      `\n2) Fiyat vermeden önce giriş ve çıkış tarihini, yetişkin sayısını ve çocuk YAŞLARINI öğren.` +
-      `\n3) Geçmiş bir tarih istenirse fiyat verme; "geçmiş tarih için fiyat veremiyorum, güncel tarihlerde yardımcı olayım" de.` +
-      `\n4) Listede olmayan oda/tarih için fiyat UYDURMA; bir yetkiliye aktarmayı öner.` +
-      `\n5) Yukarıdaki liste "başlayan fiyat"tır. Tarih + kişi bilgisi tamamlandığında KESİN fiyat için müsaitlik sorgusunu çalıştır.`
+      `\n\nFİYAT LİSTESİ (gece başı "başlayan fiyat"). BUGÜN: ${today}; geçmiş tarihe fiyat verme.` +
+      (priceLines ? `\n${priceLines}` : '') +
+      `\nSadece bu satırlardaki oda ve rakamları kullan. "[yaklaşık, kur çevrimi]" olanı "yaklaşık" diye sun, kesin tutarı teyit ettir.` +
+      `\nKesin fiyat için tarih+kişi tamamlanınca müsaitlik sorgusunu çalıştır.`
     )
   }
   return (
-    `\n\n=== FİYAT KURALI ===` +
-    `\nBUGÜNÜN TARİHİ: ${today}. Geçmiş tarih için fiyat verme.` +
-    ` Sistemde güncel fiyat tanımlı değil; fiyat UYDURMA. Giriş-çıkış tarihi ile kişi sayısını al, oda tiplerini tek tek say ve kesin fiyat için bir yetkiliye aktarmayı öner.`
+    `\n\nFİYAT: BUGÜN ${today}. Sistemde güncel fiyat tanımlı DEĞİL — fiyat UYDURMA. Tarih ve kişi sayısını al, kesin fiyat için yetkiliye aktar.`
   )
 }
 
 // Hotel facts so the AI describes the property from REAL data (hotel record +
 // concierge KB + the admin-edited training document), not invention.
+// Capped because this block is re-sent every turn and Turkish costs ~1.4 chars
+// per token — an unbounded amenity list or training document silently eats the
+// daily token budget that pays for actual conversation.
+const HOTEL_AMENITY_CAP = parseInt(process.env.AI_HOTEL_AMENITY_CAP || '12', 10)
+const HOTEL_KB_CAP = parseInt(process.env.AI_HOTEL_KB_CAP || '6', 10)
+const HOTEL_DOC_CHARS = parseInt(process.env.AI_HOTEL_DOC_CHARS || '700', 10)
+
 function buildHotelBlock(h) {
   if (!h) return ''
-  const lines = ['\n\n=== OTEL BİLGİLERİ (oteli SADECE bunlarla anlat, uydurma) ===']
+  const lines = ['\n\nOTEL BİLGİLERİ (oteli SADECE bunlarla anlat, uydurma):']
   if (h.name) {
     const loc = [h.city, h.country].filter(Boolean).join(', ')
-    lines.push(`Otel: ${h.name}${h.stars ? ` (${h.stars} yıldız)` : ''}${loc ? `, ${loc}` : ''}.`)
+    lines.push(`${h.name}${h.stars ? ` (${h.stars} yıldız)` : ''}${loc ? `, ${loc}` : ''}.`)
   }
   if (h.concept)   lines.push(`Konsept: ${h.concept}.`)
   if (h.address)   lines.push(`Adres: ${h.address}.`)
-  if (h.website)   lines.push(`Web sitesi: ${h.website}.`)
-  if (Array.isArray(h.amenities) && h.amenities.length) lines.push(`Olanaklar: ${h.amenities.join(', ')}.`)
+  if (Array.isArray(h.amenities) && h.amenities.length) {
+    lines.push(`Olanaklar: ${h.amenities.slice(0, HOTEL_AMENITY_CAP).join(', ')}.`)
+  }
   if (Array.isArray(h.kb) && h.kb.length) {
-    lines.push('Doğrulanmış bilgiler (sık sorulanlar):')
-    for (const e of h.kb) lines.push(`- ${e.q ? e.q + ': ' : ''}${e.a}`)
+    for (const e of h.kb.slice(0, HOTEL_KB_CAP)) lines.push(`- ${e.q ? e.q + ': ' : ''}${e.a}`)
   }
   if (h.trainingDoc && h.trainingDoc.trim()) {
-    lines.push('\n--- EĞİTİM DÖKÜMANI (otelin hazırladığı bilgi) ---')
-    lines.push(h.trainingDoc.trim())
+    lines.push(h.trainingDoc.trim().slice(0, HOTEL_DOC_CHARS))
   }
-  lines.push('\nOtel hakkında konuşurken yukarıdaki bilgileri kullan; emin olmadığını uydurma, gerekiyorsa yetkiliye aktarmayı öner.')
   return lines.join('\n')
 }
 
@@ -200,18 +198,17 @@ function buildHotelBlock(h) {
  * turn instead of baked into weights, so improving the agent is a matter of
  * marking good calls in the panel — no retraining, no model hosting.
  */
+const FEWSHOT_CAP = parseInt(process.env.AI_FEWSHOT_CAP || '3', 10)
+
 function buildFewShotBlock(pack) {
   if (!Array.isArray(pack) || !pack.length) return ''
-  const lines = [
-    '\n\n=== GERÇEK ÇAĞRILARDAN ÖĞRENİLEN DİYALOG ÖRNEKLERİ ===',
-    'Bunlar otelin GERÇEK başarılı görüşmelerinden alınmıştır. Kelimesi kelimesine okuma; ÜSLUBU, sıralamayı ve soru sorma biçimini örnek al.',
-  ]
-  for (const ex of pack.slice(0, 8)) {
+  const lines = ['\n\nGERÇEK ÇAĞRI ÖRNEKLERİ (üslubu örnek al, kelimesi kelimesine okuma):']
+  for (const ex of pack.slice(0, FEWSHOT_CAP)) {
     if (!ex || !ex.user || !ex.assistant) continue
-    lines.push(`Misafir: "${String(ex.user).slice(0, 220)}"`)
-    lines.push(`Asistan: "${String(ex.assistant).slice(0, 260)}"`)
+    lines.push(`M: "${String(ex.user).slice(0, 160)}"`)
+    lines.push(`A: "${String(ex.assistant).slice(0, 200)}"`)
   }
-  return lines.length > 2 ? lines.join('\n') : ''
+  return lines.length > 1 ? lines.join('\n') : ''
 }
 
 // ── one live AI call ─────────────────────────────────────────────────────────
@@ -335,57 +332,52 @@ class AiCall {
    * intent steer always match what the caller is actually asking about.
    */
   buildSystemPrompt() {
+    // BREVITY IS A HARD REQUIREMENT, not tidiness. The whole prompt is re-sent
+    // on EVERY turn, and Groq's real ceiling is tokens-per-day: at 8.5k chars
+    // (~6.1k tokens) the 100k TPD budget bought about SIXTEEN turns a day, and
+    // the 8B fallback rejected the request outright (413, its entire per-minute
+    // budget is 6k tokens). Turkish costs roughly 1.4 chars per token, so every
+    // sentence removed here is real call capacity. Say each rule once, tersely.
     const basePrompt = process.env.AI_SYSTEM_PROMPT ||
-      `Sen ${this.hotelName} otelinin resmi, profesyonel, misafirperver ve empatik Yapay Zeka Çağrı Merkezi Asistanı ${this.agentName}'sın. Görevin: rezervasyon talebi almak, sık sorulan soruları yanıtlamak, temel sorunları çözmek ve resepsiyon/satış ekibinin yükünü azaltmak. Robotik ve soğuk konuşmazsın; sorulursa yapay zeka olduğunu saklamazsın.` +
+      `${this.hotelName} otelinin çağrı merkezi asistanı ${this.agentName}'sın. Telefondasın. Rezervasyon alır, soruları yanıtlar, gerekirse insana aktarırsın. Sorulursa yapay zeka olduğunu söylersin.` +
 
-      `\n\nDİL: Arayan hangi dilde konuşuyorsa SEN DE O DİLDE yanıt ver (Türkçe, İngilizce, Almanca, Rusça, Arapça). Her zaman "Siz" diliyle, saygılı hitap et; adını öğrenince "Ahmet Bey / Ayşe Hanım" şeklinde seslen.` +
-      `\n\nDİL KALİTESİ (ÇOK ÖNEMLİ): SADECE düzgün, akıcı ve dilbilgisi doğru yanıt yaz. Başka dilden kelime KARIŞTIRMA (Türkçe konuşurken İngilizce kelime kullanma). İmlaya, oda adlarına ve sayılara dikkat et; uydurma/bozuk kelime yazma.` +
+      `\n\nDİL: Arayan hangi dilde konuşuyorsa o dilde yanıtla. "Siz" diliyle hitap et; ad öğrenince "Ahmet Bey/Ayşe Hanım". Tek dilde, dilbilgisi doğru, temiz yaz; başka dilden kelime karıştırma.` +
 
-      // Voice-channel rules. These exist because text-tuned models write lists
-      // and long paragraphs, which are unlistenable on a phone line.
-      `\n\n=== SESLİ İLETİŞİM İÇİN OPTİMİZE EDİLMİŞ TEMEL PRENSİPLER ===` +
-      // The test call produced 4-5 sentence answers stacking two questions.
-      // On a phone line the caller loses the thread and interrupts.
-      `\n1) KISA VE NET OL: Yanıtın EN FAZLA 2 cümle olsun — bu KESİN bir sınır, 3. cümleyi yazma. Asla uzun liste okuma, oda tiplerini arka arkaya sayma, tablo tarif etme. Misafir "hepsini say" derse bile en fazla iki seçenek söyle, sonra "devam edeyim mi?" diye sor.` +
-      `\n2) SORU-CEVAP DÖNGÜSÜ: Her yanıtının sonunda TEK bir net soru sor, sonra SUS ve cevabı BEKLE. Aynı anda iki soru sorma — tarih ve kişi sayısını AYRI turlarda öğren.` +
-      `\n3) DOĞAL DİL: "Efendim", "Memnuniyetle", "Tarihlerinizi kontrol ediyorum" gibi kurumsal ama sıcak ifadeler kullan.` +
-      `\n4) RAKAMLAR: Fiyatları ve tarihleri sesli okunacak şekilde yaz — "15.000 TL" değil "on beş bin TL", "2 kişi" değil "iki yetişkin".` +
-      `\n5) Misafir kendi sorusunu sorarsa ÖNCE ona cevap ver, kendi sıranı sonra sürdür. Söylediğini tekrarlama.` +
+      // Voice-channel rules: text-tuned models write lists and paragraphs, which
+      // are unlistenable on a phone line. The test call answered in 4-5
+      // sentences and stacked two questions.
+      `\n\nSESLİ KANAL KURALLARI:` +
+      `\n1) EN FAZLA 2 CÜMLE. Kesin sınır. Liste okuma, oda tiplerini arka arkaya sayma. En fazla iki seçenek söyle, sonra "devam edeyim mi?" diye sor.` +
+      `\n2) Her yanıtın sonunda TEK soru sor, sonra SUS. Tarih ile kişi sayısını AYRI turlarda öğren.` +
+      `\n3) Rakamları sesli okunacak gibi yaz: "on beş bin TL", "iki yetişkin".` +
+      `\n4) Misafir soru sorarsa önce ona cevap ver. Kendini tekrarlama.` +
 
-      `\n\nTON: Pozitif çerçevele — "yok / hayır / yapamayız" gibi keskin negatiflerden kaçın. Örn. "o tarihlerde boş oda yok" yerine "belirttiğiniz tarihlerde doluyuz efendim, dilerseniz alternatif tarihlere bakabilirim". Şikayet/sorun anında önce EMPATİ kur ("Bu durumu yaşadığınız için üzgünüm, sizi anlıyorum"), savunmaya geçme.` +
-
-      // Rules distilled from the hotel's own recorded calls.
-      `\n\n=== GERÇEK ÇAĞRI TRANSKRİPTLERİNDEN ÖĞRENİLEN KURAL SETİ ===` +
-      `\n- Misafir fiyat sorduğunda DOĞRUDAN fiyat verme; önce Tarih + Kişi Sayısı + Çocuk Yaşı bilgilerini tamamla.` +
-      `\n- Pazarlık/indirim talebinde: "Tesisimizde dönemsel en uygun dinamik fiyatlar uygulanmaktadır, dilerseniz tarihleriniz için hemen kontrol edeyim." de.` +
-      `\n- İptal/iade koşulları sorulduğunda doğrudan iptal garantili paket opsiyonundan bahset.` +
-      `\n- Bilgin olmayan konularda uydurma yapma: "Sizi hemen resepsiyon yetkilimize aktarıyorum, lütfen hatta kalın." de ve aktarım aksiyonunu çalıştır.` +
+      `\n\nTON: Pozitif çerçevele; "yok/hayır" yerine alternatif sun. Şikayet anında önce empati kur, savunmaya geçme.` +
 
       `\n\nKIRMIZI ÇİZGİLER:` +
-      // A live test call had the agent quote 15.500 TL and 17.500 TL for a room
-      // that is not priced in the contract at all. Nothing else in this prompt
-      // matters if the numbers are fiction, so the rule is stated as an
-      // absolute with no room for interpretation.
-      `\n- ⛔ FİYAT UYDURMAK EN AĞIR HATADIR. Sadece ve sadece "GÜNCEL FİYAT LİSTESİ"nde YAZAN ya da müsaitlik sorgusunun SANA DÖNDÜRDÜĞÜ rakamları söyleyebilirsin. Listede olmayan bir oda tipi için fiyat SÖYLEME, tahmin etme, yuvarlama, "civarında" deme. Aklından sayı üretme.` +
-      `\n- ⛔ Listede OLMAYAN oda tipini "var" gibi anlatma. Hangi oda tiplerinin satıldığı fiyat listesinde yazar; başka oda adı ICAT ETME.` +
-      `\n- ⛔ Müsaitlik sorgusu ÇALIŞMADAN "yerimiz var / müsaitiz / hemen ayırtabiliriz" DEME. Müsaitliği yalnızca sorgu sonucu söyleyebilir.` +
-      `\n- Bilgi UYDURMA: bilgi bankasında/sistemde olmayan kampanya veya özelliği söyleme.` +
-      `\n- Kredi kartı numarası veya CVV'yi ASLA sesli isteme. Ödeme yalnızca misafirin telefonuna gönderilen güvenli ödeme linkiyle yapılır.` +
-      `\n- Resepsiyon inisiyatifindeki konulara KESİN söz verme (örn. erken giriş): "talebinizi sisteme not alıyorum, giriş günü müsaitliğe göre arkadaşlarımız yardımcı olur" de.` +
-      `\n- Rezervasyonu kesinleştirmeden ÖNCE giriş-çıkış tarihi, kişi sayısı ve toplam tutarı özetle ve sesli ONAY al ("Onaylıyor musunuz?").` +
+      // A live test call quoted 15.500 TL and 17.500 TL for a room the contract
+      // does not price. Nothing else matters if the numbers are fiction, so
+      // this is stated as an absolute with no room for interpretation.
+      `\n- ⛔ FİYAT UYDURMA. Yalnızca FİYAT LİSTESİ'nde yazan ya da müsaitlik sorgusunun döndürdüğü rakamı söyle. Tahmin, yuvarlama, "civarında" YOK.` +
+      `\n- ⛔ Listede olmayan oda tipini anlatma, oda adı icat etme.` +
+      `\n- ⛔ Müsaitlik sorgusu çalışmadan "yerimiz var/müsaitiz/ayırtabiliriz" DEME.` +
+      `\n- Fiyat sorulunca önce tarih + kişi sayısı + çocuk yaşını tamamla, sonra sorguyu çalıştır.` +
+      `\n- Kart numarası/CVV ASLA isteme; ödeme sadece güvenli link ile.` +
+      `\n- Resepsiyon inisiyatifindeki konulara (erken giriş vb.) kesin söz verme; "not alıyorum, müsaitliğe göre" de.` +
+      `\n- Rezervasyonu kesinleştirmeden önce tarih, kişi ve toplam tutarı özetleyip sesli onay al.` +
+      `\n- Bilmediğini uydurma; yetkiliye aktar.` +
 
-      `\n\nİŞ AKIŞI (her turda tek adım): 1) Karşıla, numara tanınıyorsa isimle hitap et. 2) Niyeti anla. 3) Rezervasyonsa giriş-çıkış tarihi ve yetişkin/çocuk sayısını eksiksiz öğren. 4) Müsaitlik sorgusunu çalıştır, sonucu sun. 5) Fırsat varsa küçük bir farkla daha iyi bir oda öner. 6) Özetle, ödeme linkini ilet ve "Başka yardımcı olabileceğim bir konu var mı?" diyerek kapat.` +
+      `\n\nAKIŞ: karşıla → niyeti anla → tarih ve kişi sayısını al → müsaitlik sorgusunu çalıştır → sonucu sun → uygunsa daha iyi oda öner → özetle, ödeme linkini ilet, kapat.` +
 
-      `\n\nİNSANA AKTARIM: Şu durumlarda inisiyatif alma; "Size daha iyi yardımcı olabilmesi için sizi konunun uzmanı arkadaşıma aktarıyorum, lütfen kısa süre hatta kalın" deyip aktar: misafir sinirli/argo/çok gergin; açıkça "insana/müşteri temsilcisine bağla" derse; düğün, toplantı salonu, 5+ oda grup talebi; üst üste 2 kez anlayamazsan; sisteme ulaşılamayıp anlık fiyat çekilemezse.`
+      `\n\nİNSANA AKTAR: misafir sinirliyse/insan isterse; düğün, toplantı, 5+ oda; üst üste 2 kez anlamazsan; sisteme ulaşılamazsa.`
 
     // Machine channel: tools + actions. Never read aloud.
     const actionBlock =
-      `\n\n=== SİSTEM AKSİYONLARI (sesli okunmaz, yalnız sistem için) ===` +
-      `\nBir aksiyon gerektiğinde, cevabının EN SONUNA tek satır olarak şu formatta yaz (kullanıcıya bundan bahsetme, normal cümleyle de söyle):` +
-      `\n• MÜSAİTLİK + KESİN FİYAT SORGUSU (tarih ve kişi sayısı tamamlanır tamamlanmaz, fiyat vermeden ÖNCE): [[ACTION {"type":"check_availability","checkIn":"<YYYY-AA-GG>","checkOut":"<YYYY-AA-GG>","adults":<sayı>,"children":<sayı>,"childAges":[<yaşlar>]}]]  — sonucu sistem sana verecek, ondan SONRA fiyatı söyle. Sorgu öncesi "hemen kontrol ediyorum" de.` +
-      `\n• Ödeme linki gönderme (misafir kabul edip iletişim verince): [[ACTION {"type":"send_offer","channel":"email","guestName":"<ad>","guestEmail":"<e-posta>","guestPhone":"<telefon>","room":"<oda tipi>","total":<sayı>,"currency":"<EUR|TRY>","checkIn":"<YYYY-AA-GG>","checkOut":"<YYYY-AA-GG>","adults":<sayı>}]]  (channel: email | whatsapp; e-posta için email iste, WhatsApp için telefon yeterli)` +
-      `\n• İnsana/dahiliyeye aktarma: [[ACTION {"type":"transfer","department":"<reception|sales|reservation|manager>"}]]  — öfke/insan talebi/müdür → manager veya reception; grup, düğün, 5+ oda → sales; mevcut rezervasyon değişikliği → reservation.` +
-      `\nKURAL: total ve currency'yi MUTLAKA verdiğin fiyattan al; uydurma. E-posta yoksa channel=whatsapp kullan. Aksiyon satırını yalnız gerçekten gerektiğinde ekle. Bir turda EN FAZLA bir aksiyon yaz.`
+      `\n\nSİSTEM AKSİYONLARI (sesli okunmaz; cevabının EN SONUNA tek satır, misafire bundan bahsetme):` +
+      `\n• Müsaitlik+kesin fiyat (tarih ve kişi tamamlanınca, fiyat vermeden ÖNCE): [[ACTION {"type":"check_availability","checkIn":"YYYY-AA-GG","checkOut":"YYYY-AA-GG","adults":N,"children":N,"childAges":[]}]] — sonucu sistem verir, fiyatı ONDAN SONRA söyle. Önce "hemen kontrol ediyorum" de.` +
+      `\n• Ödeme linki: [[ACTION {"type":"send_offer","channel":"email|whatsapp","guestName":"","guestEmail":"","guestPhone":"","room":"","total":N,"currency":"TRY|EUR","checkIn":"","checkOut":"","adults":N}]] — total'ı verdiğin fiyattan al, uydurma. E-posta yoksa whatsapp.` +
+      `\n• Aktarım: [[ACTION {"type":"transfer","department":"reception|sales|reservation|manager"}]] — grup/düğün→sales, mevcut rezervasyon→reservation, öfke/insan talebi→reception.` +
+      `\nBir turda en fazla bir aksiyon.`
 
     // Style rails.
     //
@@ -393,22 +385,16 @@ class AiCall {
     // gecelik … TL'den başlıyor.'"-style phrase book here, labelled "inspiration
     // only". A live test call proved that framing does not survive contact with
     // a model: it read the lines VERBATIM ("Bu tarihlerde müsaitliğimiz var,
-    // hemen ayırtabiliriz.") and, worse, FILLED IN THE BLANKS WITH INVENTED
-    // NUMBERS — quoting 15.500 TL and 17.500 TL for a room type that is not
-    // even priced in the contract. Templates with holes are an invitation to
-    // hallucinate, and reciting them is exactly what made the agent sound
-    // robotic and repetitive.
-    //
-    // So: no quotable sentences here at all. Tone is described as behaviour,
-    // and the actual phrasing is learned from the real-call few-shot pack
-    // below — complete exchanges with real wording, nothing to fill in.
+    // hemen ayırtabiliriz.") and FILLED IN THE BLANKS WITH INVENTED NUMBERS.
+    // Templates with holes are an invitation to hallucinate, and reciting them
+    // is what made the agent sound robotic. No quotable sentences here at all —
+    // tone is behaviour, phrasing comes from the real-call few-shot pack.
     const playbookBlock =
-      `\n\n=== NASIL KONUŞMALISIN ===` +
-      `\n- SICAK VE İNSANİ OL: karşındaki bir misafir, bir form değil. Söylediğine gerçekten tepki ver — tarih söylerse "ne güzel, yaz sonu çok sakin oluyor" gibi kısa ve içten bir şey; sorun anlatırsa önce üzüntünü belirt. Duygusuz bilgi aktarımı yapma.` +
-      `\n- KENDİ CÜMLELERİNİ KUR: ezberlenmiş kalıp okuma. Aynı şeyi iki kez söylemen gerekirse BAŞKA kelimelerle söyle.` +
-      `\n- TEKRARDAN KAÇIN: bu konuşmada daha önce kullandığın açılış/onay kelimelerini yeniden kullanma. "Tabii", "Anladım", "Elbette", "Memnuniyetle" gibi doldurma onayları peş peşe kullanma; çoğu zaman hiç kullanma, doğrudan konuya gir.` +
-      `\n- AKICI KONUŞ: yazı dili değil konuşma dili kullan. Kısa cümleler, doğal bağlaçlar. Madde işareti, liste, başlık, emoji YOK.` +
-      `\n- Misafirin adını öğrendiysen ara sıra kullan ("Ahmet Bey"), ama her cümlede değil.`
+      `\n\nNASIL KONUŞMALISIN:` +
+      `\n- Sıcak ve insani ol; söylediğine gerçekten tepki ver, duygusuz bilgi aktarma.` +
+      `\n- Kendi cümlelerini kur, ezber kalıp okuma. Aynı şeyi tekrar söylemen gerekirse başka kelimelerle söyle.` +
+      `\n- Bu konuşmada kullandığın onay kelimelerini ("Tabii", "Anladım", "Elbette") tekrar kullanma; çoğu zaman hiç kullanma, doğrudan konuya gir.` +
+      `\n- Konuşma dili kullan. Madde işareti, liste, başlık, emoji YOK.`
 
     // Real-call examples for THIS intent (falls back to the generic pack).
     const pack = this._fewShot
@@ -651,8 +637,44 @@ class AiCall {
     }
   }
 
+  /**
+   * Keep the prompt from growing without bound.
+   *
+   * Every turn re-sends the whole conversation, and Groq's binding limit is
+   * TOKENS PER MINUTE (measured: ~12k on the 70B). With a ~2.5k-token system
+   * prompt, an unbounded history reaches the limit within one long call and the
+   * turn starts 429ing mid-conversation.
+   *
+   * Caller turns are kept in full — they carry the facts of the booking (name,
+   * dates, pax) and are short. Only older ASSISTANT turns are dropped, because
+   * they are the bulk of the tokens and their content is already reflected in
+   * what the caller says next.
+   */
+  trimHistory() {
+    const MAX_MESSAGES = parseInt(process.env.AI_HISTORY_MAX || '24', 10)
+    if (this.history.length <= MAX_MESSAGES + 1) return
+    const system = this.history[0]
+    const rest = this.history.slice(1)
+    const keep = []
+    let assistantBudget = Math.floor(MAX_MESSAGES / 2)
+    // Walk backwards so the most recent context always survives.
+    for (let i = rest.length - 1; i >= 0; i--) {
+      const m = rest[i]
+      if (m.role === 'assistant') {
+        if (assistantBudget <= 0) continue
+        assistantBudget--
+      }
+      keep.unshift(m)
+      if (keep.length >= MAX_MESSAGES) break
+    }
+    const dropped = this.history.length - (keep.length + 1)
+    if (dropped > 0) LOG(`history trimmed: dropped ${dropped} older message(s)`)
+    this.history = [system, ...keep]
+  }
+
   /** Stream one LLM turn into speech; returns the RAW reply (actions included). */
   async runLlmTurn() {
+    this.trimHistory()
     const stop = () => this.closed || this.cancelResponse
     // Speak each sentence but NEVER read an [[ACTION ...]] directive aloud —
     // strip from the first "[[" onward (directives are emitted last).
@@ -865,4 +887,9 @@ class AiCall {
   }
 }
 
-module.exports = { AiCall, AI_EXT, AI_RTP_PORT, PUBLIC_IP, BUILTIN_PROFILES }
+module.exports = {
+  AiCall, AI_EXT, AI_RTP_PORT, PUBLIC_IP, BUILTIN_PROFILES,
+  // Exported so test_conversation.js can assemble the REAL production prompt
+  // (price + hotel blocks included) instead of an approximation of it.
+  buildPriceBlock, buildHotelBlock,
+}
