@@ -459,6 +459,13 @@ async function streamOnce(ep, messages, onSentence, shouldStop, opts) {
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ep.key}` },
     body: JSON.stringify({
       model: ep.model, messages,
+      // NATIVE TOOL CALLING when the caller supplies a schema. Asking a model to
+      // emit a magic `[[ACTION {...}]]` string is a coin flip across vendors —
+      // measured, Cerebras emitted it reliably and Mistral almost never did,
+      // which silently disabled the availability lookup. A declared tool is
+      // part of the API contract instead of a formatting habit. The text
+      // directive still works as a fallback for endpoints that ignore `tools`.
+      ...(opts.tools && opts.tools.length ? { tools: opts.tools, tool_choice: 'auto' } : {}),
       // Live calls came back robotic and repetitive: the same acknowledgements
       // ("Tabii", "Anladım") and the same sentence shapes every turn. 0.4 with
       // no penalties makes a model settle into one groove and stay there.
@@ -495,6 +502,9 @@ async function streamOnce(ep, messages, onSentence, shouldStop, opts) {
   const reader = r.body.getReader()
   const dec = new TextDecoder()
   let buf = '', full = '', pending = '', emitted = false
+  // Tool-call fragments arrive split across chunks and keyed by index; the
+  // arguments are a JSON string built up piece by piece.
+  const toolAcc = new Map()
   const wrapped = async (s) => { emitted = true; await onSentence(s) }
   while (true) {
     if (shouldStop && shouldStop()) { try { reader.cancel() } catch {} break }
@@ -509,15 +519,31 @@ async function streamOnce(ep, messages, onSentence, shouldStop, opts) {
       const data = t.slice(5).trim()
       if (!data || data === '[DONE]') continue
       try {
-        const delta = JSON.parse(data).choices?.[0]?.delta?.content || ''
-        if (delta) { full += delta; pending += delta }
+        const delta = JSON.parse(data).choices?.[0]?.delta || {}
+        if (delta.content) { full += delta.content; pending += delta.content }
+        for (const tc of (delta.tool_calls || [])) {
+          const i = tc.index ?? 0
+          const cur = toolAcc.get(i) || { name: '', args: '' }
+          if (tc.function?.name) cur.name = tc.function.name
+          if (tc.function?.arguments) cur.args += tc.function.arguments
+          toolAcc.set(i, cur)
+        }
       } catch {}
     }
     pending = await emitSentences(pending, wrapped, shouldStop)
   }
   const rest = pending.trim()
   if (rest && !(shouldStop && shouldStop())) await wrapped(rest)
-  return { text: full.trim(), emitted }
+
+  if (toolAcc.size && opts.onToolCall) {
+    for (const { name, args } of toolAcc.values()) {
+      if (!name) continue
+      let parsed = {}
+      try { parsed = args ? JSON.parse(args) : {} } catch { LOG(`tool args unparseable for ${name}: ${args.slice(0, 120)}`) }
+      try { await opts.onToolCall(name, parsed) } catch (e) { LOG('onToolCall err', e.message) }
+    }
+  }
+  return { text: full.trim(), emitted: emitted || toolAcc.size > 0 }
 }
 
 /**

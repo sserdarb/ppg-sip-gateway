@@ -10,7 +10,7 @@
 // turns offline: same prompt, same model, same price context.
 //
 // Needs GROQ_API_KEY (run it inside the gateway container, which has one).
-const { AiCall, buildPriceBlock, buildHotelBlock } = require('./ai-agent')
+const { AiCall, buildPriceBlock, buildHotelBlock, TOOL_SCHEMAS } = require('./ai-agent')
 const { chatStream } = require('./providers')
 
 // The live Belconti call-center contract, as /api/cc/route serves it.
@@ -66,18 +66,22 @@ function spokenNumbers(text) {
   return out
 }
 
-async function runTurns(systemPrompt, turns) {
+async function runTurns(systemPrompt, turns, tools) {
   const history = [{ role: 'system', content: systemPrompt }]
   const replies = []
+  const toolCalls = []
   for (const userText of turns) {
     history.push({ role: 'user', content: userText })
     let full = ''
-    const reply = await chatStream(history, (s) => { full += (full ? ' ' : '') + s }, () => false)
+    const reply = await chatStream(history, (s) => { full += (full ? ' ' : '') + s }, () => false, {
+      tools,
+      onToolCall: (name, args) => toolCalls.push({ name, args }),
+    })
     const text = reply || full
     history.push({ role: 'assistant', content: text.replace(/\[\[ACTION[\s\S]*?\]\]/g, '').trim() })
     replies.push(text)
   }
-  return replies
+  return { replies, toolCalls }
 }
 
 ;(async () => {
@@ -99,7 +103,7 @@ async function runTurns(systemPrompt, turns) {
   ]
 
   console.log('system prompt:', systemPrompt.length, 'chars\n')
-  const replies = await runTurns(systemPrompt, TURNS)
+  const { replies, toolCalls } = await runTurns(systemPrompt, TURNS, TOOL_SCHEMAS)
 
   let fails = 0
   const check = (ok, label, detail) => {
@@ -116,9 +120,31 @@ async function runTurns(systemPrompt, turns) {
   const all = replies.join('\n')
   const spoken = all.replace(/\[\[ACTION[\s\S]*?\]\]/g, '')
 
-  // 1) The tool must fire once dates + pax are known.
-  check(/\[\[ACTION\s*\{[^}]*check_availability/.test(all),
-    'müsaitlik sorgusu çalıştırıldı')
+  // 1) The tool must fire once dates + pax are known — via EITHER channel.
+  const nativeAvail = toolCalls.find(t => t.name === 'check_availability')
+  const textAvail = /\[\[ACTION\s*\{[^}]*check_availability/.test(all)
+  check(!!nativeAvail || textAvail, 'müsaitlik sorgusu çalıştırıldı',
+    nativeAvail ? `native tool: ${JSON.stringify(nativeAvail.args)}` : (textAvail ? 'metin kanalı' : 'hiç çağrılmadı'))
+  // The arguments matter as much as the call. Checked for BOTH channels —
+  // checking only the native one let a wrong YEAR (2024 instead of 2026) pass
+  // silently, which the availability endpoint would refuse as a past date.
+  let args = nativeAvail?.args
+  if (!args && textAvail) {
+    const m = all.match(/\[\[ACTION\s*(\{[\s\S]*?\})\s*\]\]/)
+    try { args = m ? JSON.parse(m[1]) : null } catch { args = null }
+  }
+  if (args) {
+    const year = new Date().getFullYear()
+    check(String(args.checkIn || '').startsWith(String(year)),
+      'sorgu doğru YIL ile çağrıldı', `checkIn=${args.checkIn}`)
+    check(args.adults === 2, 'sorgu doğru kişi sayısıyla çağrıldı', `adults=${args.adults}`)
+  }
+
+  // The gateway repairs a past year before it reaches the endpoint — verify
+  // that safety net independently of what the model produced.
+  const repaired = AiCall.prototype.normalizeStayDates.call({}, { checkIn: '2024-08-08', checkOut: '2024-08-12' })
+  check(repaired.checkIn > new Date().toISOString().slice(0, 10) || repaired.checkIn === new Date().toISOString().slice(0, 10),
+    'geçmiş yıl otomatik düzeltiliyor', `2024-08-08 → ${repaired.checkIn}→${repaired.checkOut}`)
 
   // 2) No invented prices.
   const nums = spokenNumbers(spoken).filter(n => n >= 5000 && n <= 500000)
@@ -134,6 +160,12 @@ async function runTurns(systemPrompt, turns) {
   // 4) No availability claim before the tool result exists.
   check(!/müsaitliğimiz var|yerimiz var|hemen ayırtabilir|boş odamız var/i.test(spoken),
     'sorgu sonucu olmadan "müsaitiz" denmedi')
+
+  // 4b) A name the caller never gave. Addressing someone by the wrong name is
+  //     worse than using none, and it makes the rest sound invented too.
+  const inventedNames = spoken.match(/\b([A-ZÇĞİÖŞÜ][a-zçğıöşü]{2,})\s+(Bey|Han[ıi]m)\b/g) || []
+  check(inventedNames.length === 0, 'misafirin adı uydurulmadı',
+    inventedNames.length ? `uydurulan: ${[...new Set(inventedNames)].join(', ')}` : '')
 
   // 5) Voice length discipline.
   const longest = Math.max(...replies.map(r =>

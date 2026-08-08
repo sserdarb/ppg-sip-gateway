@@ -100,6 +100,36 @@ const BUILTIN_PROFILES = [
 /** The bare name to speak for a profile — never the admin dropdown label. */
 const profileAgentName = (p) => (p && (p.agentName || p.name)) || 'Asistan'
 
+/**
+ * Hard cap on how many sentences reach the caller in one turn.
+ *
+ * "En fazla 2 cümle" was stated, moved to the top of the prompt and repeated,
+ * and Mistral, Groq and Cerebras all still opened with four or five sentences
+ * of description — a monologue the caller talks over. A prompt is a request;
+ * this is the guarantee.
+ *
+ * Sentences past the cap are HELD, not dropped blindly: models put the hand-off
+ * question last, so `rescue()` returns it to be spoken on its own. The caller
+ * gets a short answer and still gets their turn.
+ */
+function makeSentenceCap(limit) {
+  const held = []
+  let spoken = 0
+  return {
+    /** @returns {boolean} whether this sentence should be spoken now */
+    take(sentence) {
+      if (spoken < limit) { spoken++; return true }
+      held.push(sentence)
+      return false
+    },
+    /** The question hiding in the discarded tail, if there is one. */
+    rescue() {
+      return [...held].reverse().find(s => s.trim().endsWith('?')) || null
+    },
+    get held() { return held },
+  }
+}
+
 // "Buying time" fillers per language — spoken instantly when the caller stops
 // so they hear acknowledgement while STT+LLM run (covers response latency).
 // Short, NEUTRAL acknowledgements: they fit any turn (chat or lookup) and just
@@ -224,6 +254,75 @@ function buildFewShotBlock(pack) {
   }
   return lines.length > 1 ? lines.join('\n') : ''
 }
+
+/**
+ * Declared tools, sent on every turn.
+ *
+ * These carry the same three actions the [[ACTION ...]] text channel does, but
+ * as part of the API contract rather than a formatting habit the model may or
+ * may not remember. Measured: with the text channel alone, Cerebras emitted the
+ * availability directive reliably and Mistral almost never did — which silently
+ * turned the live price lookup off. The text channel is kept as a fallback for
+ * endpoints that ignore `tools`.
+ */
+const TOOL_SCHEMAS = [
+  {
+    type: 'function',
+    function: {
+      name: 'check_availability',
+      description: 'Otelin GERÇEK müsaitliğini ve kesin fiyatını sorgular. Giriş-çıkış tarihi ve kişi sayısı belli olur olmaz, misafire fiyat söylemeden ÖNCE çağır.',
+      parameters: {
+        type: 'object',
+        properties: {
+          checkIn: { type: 'string', description: 'Giriş tarihi, YYYY-AA-GG' },
+          checkOut: { type: 'string', description: 'Çıkış tarihi, YYYY-AA-GG' },
+          adults: { type: 'integer', description: 'Yetişkin sayısı' },
+          children: { type: 'integer', description: 'Çocuk sayısı' },
+          childAges: { type: 'array', items: { type: 'integer' }, description: 'Çocukların yaşları' },
+        },
+        required: ['checkIn', 'checkOut', 'adults'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'transfer',
+      description: 'Çağrıyı bir insana aktarır. Misafir sinirliyse veya insan isterse, grup/düğün/5+ oda taleplerinde, üst üste iki kez anlaşılamadığında ya da sisteme ulaşılamadığında çağır.',
+      parameters: {
+        type: 'object',
+        properties: {
+          department: { type: 'string', enum: ['reception', 'sales', 'reservation', 'manager'] },
+          reason: { type: 'string', description: 'Kısa gerekçe' },
+        },
+        required: ['department'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'send_offer',
+      description: 'Misafire güvenli ödeme linki gönderir. Yalnızca misafir teklifi kabul edip iletişim bilgisini verdikten SONRA çağır. total değerini kendi verdiğin fiyattan al.',
+      parameters: {
+        type: 'object',
+        properties: {
+          channel: { type: 'string', enum: ['email', 'whatsapp'] },
+          guestName: { type: 'string' },
+          guestEmail: { type: 'string' },
+          guestPhone: { type: 'string' },
+          room: { type: 'string' },
+          total: { type: 'number' },
+          currency: { type: 'string', enum: ['TRY', 'EUR'] },
+          checkIn: { type: 'string' },
+          checkOut: { type: 'string' },
+          adults: { type: 'integer' },
+        },
+        required: ['channel', 'room', 'total', 'currency'],
+      },
+    },
+  },
+]
 
 // ── one live AI call ─────────────────────────────────────────────────────────
 class AiCall {
@@ -366,6 +465,15 @@ class AiCall {
     // budget is 6k tokens). Turkish costs roughly 1.4 chars per token, so every
     // sentence removed here is real call capacity. Say each rule once, tersely.
     const basePrompt = process.env.AI_SYSTEM_PROMPT ||
+      // The length cap goes FIRST because it is the rule models break most.
+      // Buried in the middle of the prompt it was ignored: a live test opened
+      // with a five-sentence paragraph, which on a phone line is a monologue.
+      // The cap counts SPOKEN sentences only. Stated without that carve-out it
+      // silently suppressed the [[ACTION]] line — the model counted the machine
+      // directive as a third sentence and dropped it, so the availability tool
+      // stopped firing. Length and tool-use were fighting each other.
+      `EN ÖNEMLİ KURAL: Misafire SÖYLEDİĞİN kısım EN FAZLA 2 CÜMLE. Tek paragraf, boş satır yok. ` +
+      `([[ACTION ...]] satırı bu sayıya DAHİL DEĞİLDİR — gerektiğinde onu her zaman ekle.)\n\n` +
       `${this.hotelName} otelinin çağrı merkezi asistanı ${this.agentName}'sın. Telefondasın. Rezervasyon alır, soruları yanıtlar, gerekirse insana aktarırsın. Sorulursa yapay zeka olduğunu söylersin.` +
 
       `\n\nDİL: Arayan hangi dilde konuşuyorsa o dilde yanıtla. "Siz" diliyle hitap et; ad öğrenince "Ahmet Bey/Ayşe Hanım". Tek dilde, dilbilgisi doğru, temiz yaz; başka dilden kelime karıştırma.` +
@@ -410,6 +518,10 @@ class AiCall {
       // checkable as prices, and a guest who books for a slide that is not
       // there arrives angry.
       `\n- ⛔ OTEL BİLGİLERİ'nde yazmayan tesis/olanak/hizmet UYDURMA (kaydırak, oyun alanı, restoran sayısı vb.). Yazmıyorsa "bu detayı yetkiliye bağlayayım" de.` +
+      // Measured: the agent addressed a caller as "Ahmet Bey" on a call where
+      // no name had been given. Calling someone by the wrong name is worse than
+      // using none, and it makes everything else it says sound invented too.
+      `\n- ⛔ MİSAFİRİN ADINI UYDURMA. Adını yalnızca misafir SÖYLEDİYSE kullan; söylemediyse isimle hitap etme, "efendim" de.` +
       `\n- ⛔ Müsaitlik sorgusu çalışmadan "yerimiz var/müsaitiz/ayırtabiliriz" DEME.` +
       `\n- Fiyat sorulunca önce tarih + kişi sayısı + çocuk yaşını tamamla, sonra sorguyu çalıştır.` +
       `\n- Kart numarası/CVV ASLA isteme; ödeme sadece güvenli link ile.` +
@@ -421,13 +533,17 @@ class AiCall {
 
       `\n\nİNSANA AKTAR: misafir sinirliyse/insan isterse; düğün, toplantı, 5+ oda; üst üste 2 kez anlamazsan; sisteme ulaşılamazsa.`
 
-    // Machine channel: tools + actions. Never read aloud.
+    // Machine channel. The declared TOOLS are the primary path (see
+    // TOOL_SCHEMAS); this block only tells the model WHEN to reach for them.
+    // Describing the old text-directive format here made the model treat tool
+    // use as an optional writing style and it asked the caller for confirmation
+    // instead of calling — so the text form is now mentioned only as a fallback.
     const actionBlock =
-      `\n\nSİSTEM AKSİYONLARI (sesli okunmaz; cevabının EN SONUNA tek satır, misafire bundan bahsetme):` +
-      `\n• Müsaitlik+kesin fiyat (tarih ve kişi tamamlanınca, fiyat vermeden ÖNCE): [[ACTION {"type":"check_availability","checkIn":"YYYY-AA-GG","checkOut":"YYYY-AA-GG","adults":N,"children":N,"childAges":[]}]] — sonucu sistem verir, fiyatı ONDAN SONRA söyle. Önce "hemen kontrol ediyorum" de.` +
-      `\n• Ödeme linki: [[ACTION {"type":"send_offer","channel":"email|whatsapp","guestName":"","guestEmail":"","guestPhone":"","room":"","total":N,"currency":"TRY|EUR","checkIn":"","checkOut":"","adults":N}]] — total'ı verdiğin fiyattan al, uydurma. E-posta yoksa whatsapp.` +
-      `\n• Aktarım: [[ACTION {"type":"transfer","department":"reception|sales|reservation|manager"}]] — grup/düğün→sales, mevcut rezervasyon→reservation, öfke/insan talebi→reception.` +
-      `\nBir turda en fazla bir aksiyon.`
+      `\n\nARAÇLAR (misafire bunlardan bahsetme):` +
+      `\n• check_availability — giriş/çıkış tarihi ve yetişkin sayısı elindeyse HEMEN çağır. ONAY SORMA, "doğru mu?" deme, tekrar tarih isteme. Önce kısaca "hemen kontrol ediyorum" de, sonra aracı çağır; kesin fiyatı ancak sonuç gelince söyle.` +
+      `\n• transfer — insana aktarım gerektiğinde.` +
+      `\n• send_offer — misafir teklifi kabul edip iletişim bilgisini verdikten sonra.` +
+      `\nBir turda en fazla bir araç. Araç çağıramıyorsan aynı bilgiyi tek satır olarak yazabilirsin: [[ACTION {"type":"check_availability","checkIn":"YYYY-AA-GG","checkOut":"YYYY-AA-GG","adults":N,"children":N}]]`
 
     // Style rails.
     //
@@ -744,10 +860,38 @@ class AiCall {
       const spoken = sentence.includes('[[') ? sentence.slice(0, sentence.indexOf('[[')).trim() : sentence
       if (spoken) this.say(spoken)
     }
-    const reply = await chatStream(this.history, speakClean, stop)
+    // Native tool calls are collected here and normalised into the same shape
+    // the [[ACTION]] parser produces, so downstream handling is identical
+    // regardless of which channel the model actually used.
+    this._nativeToolCalls = []
+    const cap = makeSentenceCap(parseInt(process.env.AI_MAX_SENTENCES || '3', 10))
+    const capped = (sentence) => {
+      const clean = sentence.includes('[[') ? sentence.slice(0, sentence.indexOf('[[')).trim() : sentence
+      if (clean && cap.take(clean)) this.say(clean)
+    }
+    const reply = await chatStream(this.history, capped, stop, {
+      tools: TOOL_SCHEMAS,
+      onToolCall: (name, args) => {
+        LOG('TOOL:', name, JSON.stringify(args))
+        this._nativeToolCalls.push({ type: name, ...args })
+      },
+    })
+    // Rescue the hand-off question from whatever was cut.
+    const rescued = cap.rescue()
+    if (cap.held.length) {
+      LOG(`sentence cap: ${cap.held.length} cümle kesildi${rescued ? ' (soru kurtarıldı)' : ''}`)
+      if (rescued && !stop()) this.say(rescued)
+    }
     if (reply) {
-      const clean = reply.replace(/\[\[ACTION[\s\S]*?\]\]/g, '').trim()
-      this.history.push({ role: 'assistant', content: clean || reply })
+      // History records what the caller ACTUALLY HEARD, not what the model
+      // wrote — otherwise the model treats its own cut sentences as delivered
+      // and builds on things the guest never heard.
+      const cleanFull = reply.replace(/\[\[ACTION[\s\S]*?\]\]/g, '').trim()
+      const dropped = cap.held.filter(s => s !== rescued)
+      const heard = dropped.length
+        ? cleanFull.split(/(?<=[.!?…])\s+/).map(s => s.trim()).filter(s => s && !dropped.includes(s)).join(' ')
+        : cleanFull
+      this.history.push({ role: 'assistant', content: heard || cleanFull || reply })
     }
     return reply
   }
@@ -759,15 +903,25 @@ class AiCall {
     else this.escalationHits = 0
   }
 
-  /** Parse every [[ACTION {json}]] directive out of a raw reply. */
+  /**
+   * Every action requested this turn, from EITHER channel: the model's native
+   * tool calls, plus any [[ACTION {json}]] directive it wrote as text. Both are
+   * supported because vendor support for `tools` is uneven — and de-duped by
+   * type so a model that does both does not trigger the same action twice.
+   */
   parseActions(rawReply) {
-    const out = []
+    const out = [...(this._nativeToolCalls || [])]
     const re = /\[\[ACTION\s*(\{[\s\S]*?\})\s*\]\]/g
     let m
     while ((m = re.exec(rawReply)) !== null) {
       try { out.push(JSON.parse(m[1])) } catch { LOG('bad action json:', m[1]) }
     }
-    return out
+    const seen = new Set()
+    return out.filter(a => {
+      if (!a || !a.type || seen.has(a.type)) return false
+      seen.add(a.type)
+      return true
+    })
   }
 
   /**
@@ -778,8 +932,45 @@ class AiCall {
    *
    * @returns {Promise<boolean>} true when the turn was handled here.
    */
+  /**
+   * Repair a stay whose YEAR the model got wrong.
+   *
+   * Measured: told "8-12 Ağustos" the model produced 2024-08-08 — its training
+   * era, not this one — even with today's date in the prompt. The endpoint
+   * would correctly refuse it as a past date and the caller would hear a
+   * failure for a perfectly ordinary request.
+   *
+   * A check-in in the past is never a real booking, so a past year is
+   * unambiguously wrong and rolling it to the next occurrence of the same
+   * month/day is the only sensible reading. The DAY is never touched, and the
+   * repair is logged so a wrong guess is visible in the call log.
+   */
+  normalizeStayDates(call) {
+    const todayStr = new Date().toISOString().slice(0, 10)
+    const bump = (iso) => {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(iso || '')) return iso
+      if (iso >= todayStr) return iso
+      const [, mmdd] = [iso.slice(0, 4), iso.slice(4)]
+      const thisYear = new Date().getFullYear()
+      const candidate = `${thisYear}${mmdd}`
+      return candidate >= todayStr ? candidate : `${thisYear + 1}${mmdd}`
+    }
+    const inFixed = bump(call.checkIn)
+    let outFixed = bump(call.checkOut)
+    // Keep the stay length: if only check-in rolled, the checkout must follow.
+    if (inFixed !== call.checkIn && outFixed <= inFixed && /^\d{4}-/.test(outFixed || '')) {
+      outFixed = `${inFixed.slice(0, 4)}${(call.checkOut || '').slice(4)}`
+      if (outFixed <= inFixed) outFixed = `${Number(inFixed.slice(0, 4)) + 1}${(call.checkOut || '').slice(4)}`
+    }
+    if (inFixed !== call.checkIn || outFixed !== call.checkOut) {
+      LOG(`stay dates repaired: ${call.checkIn}→${call.checkOut} became ${inFixed}→${outFixed} (today ${todayStr})`)
+    }
+    return { ...call, checkIn: inFixed, checkOut: outFixed }
+  }
+
   async handleToolCalls(rawReply) {
-    const call = this.parseActions(rawReply).find(a => a && a.type === 'check_availability')
+    const raw = this.parseActions(rawReply).find(a => a && a.type === 'check_availability')
+    const call = raw ? this.normalizeStayDates(raw) : null
     if (!call || !this.onTool || this._toolInFlight) return false
     this._toolInFlight = true
     this.playLookupFiller()
@@ -953,5 +1144,5 @@ module.exports = {
   AiCall, AI_EXT, AI_RTP_PORT, PUBLIC_IP, BUILTIN_PROFILES,
   // Exported so test_conversation.js can assemble the REAL production prompt
   // (price + hotel blocks included) instead of an approximation of it.
-  buildPriceBlock, buildHotelBlock,
+  buildPriceBlock, buildHotelBlock, TOOL_SCHEMAS, makeSentenceCap,
 }
