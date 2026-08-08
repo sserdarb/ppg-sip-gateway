@@ -71,22 +71,34 @@ const STT_LANG_MODE = (process.env.AI_STT_LANG_MODE || 'adaptive').toLowerCase()
 // Voice genders VERIFIED live against Google TTS voices.list (2026-06-14).
 // CRITICAL: tr-TR-Wavenet-E is MALE — it was wrongly used for the "Ayşe" female
 // profile, so callers heard a male voice. Female TR = tr-TR-Wavenet-D.
+// Names are NATIVE AND CURRENT per language, not textbook stereotypes: a German
+// caller greeted by "Greta" or a Russian one by "Наташа" hears a foreigner's
+// idea of their country. Kept in sync with PPG's BUILTIN_VOICE_PROFILES, which
+// is the canonical list — this one is only the fallback when PPG is unreachable.
+// `agentName` is the bare name the agent introduces itself with (PPG's `name`
+// carries a "(TR - Kadın)" suffix meant for the admin dropdown, which must
+// never be spoken).
 const BUILTIN_PROFILES = [
-  { id: 'female-tr', name: 'Ayşe',   gender: 'female', lang: 'tr-TR', whisperCode: 'tr', voice: 'tr-TR-Wavenet-D' },
-  { id: 'male-tr',   name: 'Ahmet',  gender: 'male',   lang: 'tr-TR', whisperCode: 'tr', voice: 'tr-TR-Wavenet-B' },
-  { id: 'female-en', name: 'Sophie', gender: 'female', lang: 'en-US', whisperCode: 'en', voice: 'en-US-Wavenet-F' },
-  { id: 'male-en',   name: 'James',  gender: 'male',   lang: 'en-US', whisperCode: 'en', voice: 'en-US-Wavenet-D' },
-  { id: 'female-de', name: 'Greta',  gender: 'female', lang: 'de-DE', whisperCode: 'de', voice: 'de-DE-Wavenet-F' },
-  { id: 'male-de',   name: 'Hans',   gender: 'male',   lang: 'de-DE', whisperCode: 'de', voice: 'de-DE-Wavenet-B' },
-  { id: 'female-ru', name: 'Наташа', gender: 'female', lang: 'ru-RU', whisperCode: 'ru', voice: 'ru-RU-Wavenet-A' },
-  { id: 'male-ru',   name: 'Иван',   gender: 'male',   lang: 'ru-RU', whisperCode: 'ru', voice: 'ru-RU-Wavenet-B' },
-  { id: 'female-sv', name: 'Maja',   gender: 'female', lang: 'sv-SE', whisperCode: 'sv', voice: 'sv-SE-Wavenet-A' },
-  { id: 'male-sv',   name: 'Erik',   gender: 'male',   lang: 'sv-SE', whisperCode: 'sv', voice: 'sv-SE-Wavenet-B' },
-  { id: 'female-fr', name: 'Claire', gender: 'female', lang: 'fr-FR', whisperCode: 'fr', voice: 'fr-FR-Wavenet-A' },
-  { id: 'male-fr',   name: 'Pierre', gender: 'male',   lang: 'fr-FR', whisperCode: 'fr', voice: 'fr-FR-Wavenet-B' },
-  { id: 'female-ar', name: 'نور',    gender: 'female', lang: 'ar-XA', whisperCode: 'ar', voice: 'ar-XA-Wavenet-A' },
-  { id: 'male-ar',   name: 'عمر',    gender: 'male',   lang: 'ar-XA', whisperCode: 'ar', voice: 'ar-XA-Wavenet-B' },
+  { id: 'female-tr', name: 'Elif',      agentName: 'Elif',      gender: 'female', lang: 'tr-TR', whisperCode: 'tr', voice: 'tr-TR-Wavenet-D' },
+  { id: 'male-tr',   name: 'Emre',      agentName: 'Emre',      gender: 'male',   lang: 'tr-TR', whisperCode: 'tr', voice: 'tr-TR-Wavenet-B' },
+  { id: 'female-en', name: 'Emily',     agentName: 'Emily',     gender: 'female', lang: 'en-US', whisperCode: 'en', voice: 'en-US-Wavenet-F' },
+  { id: 'male-en',   name: 'James',     agentName: 'James',     gender: 'male',   lang: 'en-US', whisperCode: 'en', voice: 'en-US-Wavenet-D' },
+  { id: 'female-de', name: 'Lena',      agentName: 'Lena',      gender: 'female', lang: 'de-DE', whisperCode: 'de', voice: 'de-DE-Wavenet-F' },
+  { id: 'male-de',   name: 'Lukas',     agentName: 'Lukas',     gender: 'male',   lang: 'de-DE', whisperCode: 'de', voice: 'de-DE-Wavenet-B' },
+  { id: 'female-ru', name: 'Анна',      agentName: 'Анна',      gender: 'female', lang: 'ru-RU', whisperCode: 'ru', voice: 'ru-RU-Wavenet-A' },
+  { id: 'male-ru',   name: 'Александр', agentName: 'Александр', gender: 'male',   lang: 'ru-RU', whisperCode: 'ru', voice: 'ru-RU-Wavenet-B' },
+  { id: 'female-sv', name: 'Maja',      agentName: 'Maja',      gender: 'female', lang: 'sv-SE', whisperCode: 'sv', voice: 'sv-SE-Wavenet-A' },
+  { id: 'male-sv',   name: 'Erik',      agentName: 'Erik',      gender: 'male',   lang: 'sv-SE', whisperCode: 'sv', voice: 'sv-SE-Wavenet-B' },
+  { id: 'female-fr', name: 'Camille',   agentName: 'Camille',   gender: 'female', lang: 'fr-FR', whisperCode: 'fr', voice: 'fr-FR-Wavenet-A' },
+  { id: 'male-fr',   name: 'Lucas',     agentName: 'Lucas',     gender: 'male',   lang: 'fr-FR', whisperCode: 'fr', voice: 'fr-FR-Wavenet-B' },
+  { id: 'female-ar', name: 'نور',       agentName: 'نور',       gender: 'female', lang: 'ar-XA', whisperCode: 'ar', voice: 'ar-XA-Wavenet-A' },
+  { id: 'male-ar',   name: 'عمر',       agentName: 'عمر',       gender: 'male',   lang: 'ar-XA', whisperCode: 'ar', voice: 'ar-XA-Wavenet-B' },
+  { id: 'female-el', name: 'Eleni',     agentName: 'Eleni',     gender: 'female', lang: 'el-GR', whisperCode: 'el', voice: 'el-GR-Wavenet-A' },
+  { id: 'male-el',   name: 'Nikos',     agentName: 'Nikos',     gender: 'male',   lang: 'el-GR', whisperCode: 'el', voice: 'el-GR-Wavenet-B' },
 ]
+
+/** The bare name to speak for a profile — never the admin dropdown label. */
+const profileAgentName = (p) => (p && (p.agentName || p.name)) || 'Asistan'
 
 // "Buying time" fillers per language — spoken instantly when the caller stops
 // so they hear acknowledgement while STT+LLM run (covers response latency).
@@ -101,6 +113,7 @@ const FILLERS = {
   ar: ['بالتأكيد.', 'لحظة من فضلك.', 'سأتحقق حالًا.', 'بكل سرور.', 'حالًا.'],
   sv: ['Självklart.', 'Ett ögonblick.', 'Jag kollar genast.', 'Visst.', 'Strax.'],
   fr: ['Bien sûr.', 'Un moment, s\'il vous plaît.', 'Je vérifie.', 'Certainement.', 'Tout de suite.'],
+  el: ['Βεβαίως.', 'Μια στιγμή παρακαλώ.', 'Τσεκάρω αμέσως.', 'Ευχαρίστως.', 'Αμέσως.'],
 }
 
 // Longer "I'm querying the system" lines — used only while a real tool call
@@ -113,6 +126,7 @@ const LOOKUP_FILLERS = {
   ar: 'أتحقق من هذه التواريخ في النظام، يرجى الانتظار.',
   sv: 'Jag kollar datumen i systemet, var god dröj.',
   fr: 'Je vérifie ces dates dans le système, restez en ligne.',
+  el: 'Ελέγχω αυτές τις ημερομηνίες στο σύστημα, παρακαλώ περιμένετε.',
 }
 
 // VAD / timing
@@ -255,8 +269,15 @@ class AiCall {
     // so a female agent never flips to a male voice mid-call (and vice-versa).
     this.lockedGender = this.currentProfile.gender || (this.currentProfile.id.startsWith('male') ? 'male' : 'female')
 
-    // Agent identity
-    this.agentName = agentName || this.currentProfile.name || 'Asistan'
+    // Agent identity.
+    //
+    // An operator-configured name is a deliberate choice and is PINNED. A name
+    // that merely came from the default profile is not: it must follow the
+    // caller's language, otherwise the agent switches to a German voice and
+    // still introduces itself as "Elif". Only the derived case is re-derived on
+    // a language switch — see switchProfileByLang().
+    this._agentNamePinned = !!agentName
+    this.agentName = agentName || profileAgentName(this.currentProfile)
     const hotel = HOTEL === 'otelimiz' ? 'otelimiz' : HOTEL
     this.hotelName = (hotelInfo && hotelInfo.name) || hotel
 
@@ -476,6 +497,18 @@ class AiCall {
     if (match && match.id !== this.currentProfile.id) {
       LOG(`lang switch: ${this.currentProfile.id} → ${match.id} (stt=${detectedLang}, gender=${this.lockedGender})`)
       this.currentProfile = match
+      // The persona is the voice AND the name. Leaving a Turkish name on a
+      // German voice is what made the agent say "mein Name ist Elif".
+      if (!this._agentNamePinned) {
+        const newName = profileAgentName(match)
+        if (newName !== this.agentName) {
+          LOG(`agent name: ${this.agentName} → ${newName}`)
+          this.agentName = newName
+          // The name is baked into the system prompt, so it has to be rebuilt.
+          this.systemPrompt = this.buildSystemPrompt()
+          if (this.history[0] && this.history[0].role === 'system') this.history[0].content = this.systemPrompt
+        }
+      }
       this.prewarmFiller().catch(() => {})  // warm fillers for the new language
     }
   }
