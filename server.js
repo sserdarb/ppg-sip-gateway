@@ -22,15 +22,40 @@ const PPG_API_URL    = (process.env.PPG_API_URL || 'https://ppg.pmapartner.com')
 const AI_DEFAULT_HOTEL = process.env.AI_DEFAULT_HOTEL || '' // slug the 7000 extension represents (prices/offers)
 const GATEWAY_SECRET = process.env.GATEWAY_SECRET || ''
 
-// Helper to route requests internally to avoid hairpin NAT loopback timeouts on the VPS
+/**
+ * Call PPG.
+ *
+ * This used to rewrite every request to the internal `coolify-proxy` with a Host
+ * header, to dodge hairpin-NAT loopback on the VPS. That shortcut has been
+ * answering **"404 page not found"** — plain text, so `JSON.parse` died on
+ * "Unexpected non-whitespace character after JSON at position 4" (it reads the
+ * "404" as a number, then chokes on " page"). Every inbound DID lookup in the
+ * logs shows that line, and the AI extension silently lost its whole PPG
+ * context with it: no prices, no hotel facts, no vocabulary, no few-shot. An
+ * agent with no price list is exactly an agent that invents prices.
+ *
+ * Direct HTTPS was verified working from inside this container (200 + valid
+ * JSON), so it is now the default. The internal hop stays available behind
+ * PPG_USE_INTERNAL_PROXY for the day hairpin NAT comes back — but it FALLS BACK
+ * to direct instead of failing the call, because a broken shortcut must never
+ * again masquerade as a broken API.
+ */
+const USE_INTERNAL_PROXY = process.env.PPG_USE_INTERNAL_PROXY === '1'
+
 async function apiFetch(url, options = {}) {
-  let targetUrl = url;
-  const headers = { ...(options.headers || {}) };
-  if (targetUrl.includes('ppg.pmapartner.com')) {
-    targetUrl = targetUrl.replace('https://ppg.pmapartner.com', 'http://coolify-proxy');
-    headers['Host'] = 'ppg.pmapartner.com';
+  const headers = { ...(options.headers || {}) }
+  if (!USE_INTERNAL_PROXY || !url.includes('ppg.pmapartner.com')) {
+    return fetch(url, { ...options, headers })
   }
-  return fetch(targetUrl, { ...options, headers });
+  const internalUrl = url.replace('https://ppg.pmapartner.com', 'http://coolify-proxy')
+  try {
+    const r = await fetch(internalUrl, { ...options, headers: { ...headers, Host: 'ppg.pmapartner.com' } })
+    if (r.ok) return r
+    console.warn(`[ppg] internal proxy returned ${r.status} — retrying directly`)
+  } catch (e) {
+    console.warn(`[ppg] internal proxy failed (${e.message}) — retrying directly`)
+  }
+  return fetch(url, { ...options, headers })
 }
 
 // ── rtpengine client (optional — only used when host is configured) ─────────
