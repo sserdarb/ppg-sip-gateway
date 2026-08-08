@@ -243,7 +243,8 @@ class AiCall {
    * @param {Function}[opts.onTool]               — async (toolCall) => result  (availability lookups)
    */
   constructor({
-    remoteIp, remotePort, onBye, greetingOverride, agentName, voiceProfiles, defaultVoiceProfileId,
+    remoteIp, remotePort, onBye, greetingOverride, agentName, defaultAgentName,
+    voiceProfiles, defaultVoiceProfileId,
     priceContext, hotelInfo, sttVocabulary, fewShot, hotelId, callId, caller, onEnd, onAction, onTool,
   } = {}) {
     this.remoteIp   = remoteIp
@@ -276,8 +277,13 @@ class AiCall {
     // caller's language, otherwise the agent switches to a German voice and
     // still introduces itself as "Elif". Only the derived case is re-derived on
     // a language switch — see switchProfileByLang().
-    this._agentNamePinned = !!agentName
-    this.agentName = agentName || profileAgentName(this.currentProfile)
+    // PPG sends `agentName` ONLY when the hotel configured one, and passes the
+    // per-language default separately as `defaultAgentName` — collapsing the
+    // two would make every call look pinned and freeze the name in one language.
+    this._agentNamePinned = !!(agentName && String(agentName).trim())
+    this.agentName = this._agentNamePinned
+      ? String(agentName).trim()
+      : (defaultAgentName || profileAgentName(this.currentProfile))
     const hotel = HOTEL === 'otelimiz' ? 'otelimiz' : HOTEL
     this.hotelName = (hotelInfo && hotelInfo.name) || hotel
 
