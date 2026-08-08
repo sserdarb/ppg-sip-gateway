@@ -365,7 +365,16 @@ const OPENROUTER_MODEL = process.env.OPENROUTER_LLM_MODEL || 'meta-llama/llama-3
 // a fast wrong answer. Cerebras answers in ~520ms, passes every check, and has
 // its own quota. Groq stays second (it is faster when it has budget),
 // OpenRouter fourth (~2.2s and currently out of credits).
-const LLM_ORDER = parseOrder(process.env.AI_LLM_CHAIN, 'cerebras,groq,openrouter,nvidia')
+// GROQ FIRST for Turkish QUALITY, Cerebras second for THROUGHPUT — measured,
+// and the split is real:
+//   groq llama-3.3-70b : clean Turkish, but ~12k tokens/min and 100k/day means
+//                        it 429s after 2-3 turns and is spent in ~30 turns/day
+//   cerebras gpt-oss   : never runs out, ~520ms, but weaker Turkish (has leaked
+//                        English words and even CJK characters mid-sentence)
+// So Groq answers while it can and Cerebras carries the rest of the day. A 429
+// costs only the failed request, which returns immediately.
+// NOTE: no free tier here can sustain a real call volume — see README.
+const LLM_ORDER = parseOrder(process.env.AI_LLM_CHAIN, 'groq,cerebras,openrouter,nvidia')
 
 function llmChain() {
   const byVendor = {
