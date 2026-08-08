@@ -349,6 +349,12 @@ async function synthesize(text, profile) {
  * the call. All four speak the OpenAI chat API, so they share one code path.
  * Order via AI_LLM_CHAIN (default "groq,cerebras,openrouter,nvidia").
  */
+const MISTRAL_KEY = process.env.MISTRAL_API_KEY || ''
+const MISTRAL_MODEL = process.env.MISTRAL_LLM_MODEL || 'mistral-small-latest'
+const ZHIPU_KEY = process.env.ZHIPU_API_KEY || ''
+// Measured: glm-4-flash / glm-4 / glm-4-air all answer "模型不存在" on this
+// account and glm-4-plus is out of balance. glm-4.5-flash is the one that works.
+const ZHIPU_MODEL = process.env.ZHIPU_LLM_MODEL || 'glm-4.5-flash'
 const CEREBRAS_KEY = process.env.CEREBRAS_API_KEY || ''
 // Valid ids on this account (GET /v1/models): gpt-oss-120b, zai-glm-4.7,
 // gemma-4-31b. Measured on the real call script: gpt-oss-120b at
@@ -365,16 +371,21 @@ const OPENROUTER_MODEL = process.env.OPENROUTER_LLM_MODEL || 'meta-llama/llama-3
 // a fast wrong answer. Cerebras answers in ~520ms, passes every check, and has
 // its own quota. Groq stays second (it is faster when it has budget),
 // OpenRouter fourth (~2.2s and currently out of credits).
-// GROQ FIRST for Turkish QUALITY, Cerebras second for THROUGHPUT — measured,
-// and the split is real:
-//   groq llama-3.3-70b : clean Turkish, but ~12k tokens/min and 100k/day means
-//                        it 429s after 2-3 turns and is spent in ~30 turns/day
-//   cerebras gpt-oss   : never runs out, ~520ms, but weaker Turkish (has leaked
-//                        English words and even CJK characters mid-sentence)
-// So Groq answers while it can and Cerebras carries the rest of the day. A 429
-// costs only the failed request, which returns immediately.
-// NOTE: no free tier here can sustain a real call volume — see README.
-const LLM_ORDER = parseOrder(process.env.AI_LLM_CHAIN, 'groq,cerebras,openrouter,nvidia')
+// Order chosen from MEASURED throughput + Turkish quality, not reputation.
+// Every candidate PPG holds a key for was probed on the same Turkish task:
+//
+//   mistral-small-latest  437ms  clean   50k tokens/min, 50 req/min, NO daily cap
+//   groq llama-3.3-70b    287ms  clean   12k tokens/min AND only 100k/day (~30 turns)
+//   cerebras gpt-oss-120b 520ms  weak    always up, but leaks English/CJK mid-sentence
+//   zhipu glm-4.5-flash  3378ms  clean   works, but 3.4s is a long silence on a call
+//   openrouter           2177ms    —     402, out of credits
+//   deepseek                 —      —     402, insufficient balance
+//   gemini (4 keys)          —      —     429 on every key
+//
+// MISTRAL LEADS because a phone line needs predictable turns more than it needs
+// the last 150ms: Groq is marginally faster and cleaner but 429s for most of the
+// day, and a dead primary costs a wasted round trip on every single turn.
+const LLM_ORDER = parseOrder(process.env.AI_LLM_CHAIN, 'mistral,groq,cerebras,openrouter,zhipu,nvidia')
 
 function llmChain() {
   const byVendor = {
@@ -398,10 +409,25 @@ function llmChain() {
       url: 'https://api.cerebras.ai/v1/chat/completions',
       key: CEREBRAS_KEY, model: CEREBRAS_MODEL, reasoningEffort: 'low',
     }] : [],
+    // The workhorse: 50k tokens AND 50 requests per minute with no daily cap
+    // (measured from its own rate-limit headers), clean Turkish, ~440ms. That
+    // combination is what a phone line actually needs — Groq is faster and
+    // marginally cleaner but runs out after ~30 turns a day.
+    mistral: () => MISTRAL_KEY ? [{
+      name: `mistral:${MISTRAL_MODEL}`,
+      url: 'https://api.mistral.ai/v1/chat/completions',
+      key: MISTRAL_KEY, model: MISTRAL_MODEL,
+    }] : [],
     openrouter: () => OPENROUTER_KEY ? [{
       name: `openrouter:${OPENROUTER_MODEL}`,
       url: 'https://openrouter.ai/api/v1/chat/completions',
       key: OPENROUTER_KEY, model: OPENROUTER_MODEL,
+    }] : [],
+    // Last resort — works, but ~3.4s is a long silence on a call.
+    zhipu: () => ZHIPU_KEY ? [{
+      name: `zhipu:${ZHIPU_MODEL}`,
+      url: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+      key: ZHIPU_KEY, model: ZHIPU_MODEL,
     }] : [],
     nvidia: () => NVIDIA_KEY ? [{
       name: `nvidia:${NVIDIA_LLM_MODEL}`,
