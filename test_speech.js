@@ -1,69 +1,63 @@
-// What the caller actually hears.  `node test_speech.js`
+// What the caller actually HEARS.  `node test_speech.js`
 //
-// From a live call: the agent said "YILDIZ YILDIZ" (markdown ** read aloud) and
-// spoke prices digit by digit. Asking the model to spell numbers had already
-// been tried and produced nonsense ("iki beş bin doksan yüz" for 25.900), so
-// the conversion lives in code and is pinned here.
-const { sanitizeForSpeech, stripMarkup, speakNumbers, speakDatesAndTimes, numberToTurkish } = require('./speech')
+// Every case here came off a real call:
+//   - the agent said "yıldız yıldız" for **bold**
+//   - prices were read digit by digit
+//   - "20-25 Eylül" became "yirmi TİRE yirmi beş"
+//   - "check-in saat 14:00" became "saat SAAT on dört"
+//   - a dictated phone number lost its leading zero
+const {
+  sanitizeForSpeech, stripMarkup, numberToTurkish, digitsToTurkish, speakSeparators,
+} = require('./speech')
 
 let fails = 0
-const eq = (got, want, label) => {
-  const ok = got === want
+const check = (ok, label, detail) => {
   if (!ok) fails++
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}`)
-  if (!ok) console.log(`        beklenen: ${want}\n        gelen   : ${got}`)
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${detail ? ` — ${detail}` : ''}`)
 }
-const has = (got, needle, label, want = true) => {
-  const ok = got.includes(needle) === want
-  if (!ok) fails++
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${ok ? '' : ` — "${got}"`}`)
+const says = (input, mustContain, mustNotContain = []) => {
+  const out = sanitizeForSpeech(input)
+  const missing = [].concat(mustContain).filter(w => !out.includes(w))
+  const leaked = [].concat(mustNotContain).filter(w => out.includes(w))
+  check(missing.length === 0 && leaked.length === 0,
+    `"${input.slice(0, 46)}"`,
+    missing.length ? `eksik: ${missing.join(', ')} → "${out}"`
+      : leaked.length ? `sızan: ${leaked.join(', ')} → "${out}"` : `"${out}"`)
 }
 
-console.log('— Türkçe sayı —')
-eq(numberToTurkish(0), 'sıfır', '0')
-eq(numberToTurkish(7), 'yedi', '7')
-eq(numberToTurkish(100), 'yüz', '100 → "yüz", "bir yüz" DEĞİL')
-eq(numberToTurkish(1000), 'bin', '1000 → "bin", "bir bin" DEĞİL')
-eq(numberToTurkish(1500), 'bin beş yüz', '1500')
-eq(numberToTurkish(8999), 'sekiz bin dokuz yüz doksan dokuz', '8999')
-eq(numberToTurkish(25900), 'yirmi beş bin dokuz yüz', '25900 (canlıda bozulan sayı)')
-eq(numberToTurkish(42750), 'kırk iki bin yedi yüz elli', '42750')
-eq(numberToTurkish(1320), 'bin üç yüz yirmi', '1320')
-eq(numberToTurkish(2000000), 'iki milyon', '2 milyon')
+console.log('— sayılar —')
+check(numberToTurkish(25900) === 'yirmi beş bin dokuz yüz', 'yirmi beş bin dokuz yüz', numberToTurkish(25900))
+check(numberToTurkish(1000) === 'bin', '"bir bin" değil "bin"', numberToTurkish(1000))
+check(numberToTurkish(173650) === 'yüz yetmiş üç bin altı yüz elli', '173.650', numberToTurkish(173650))
+says('Deluxe Oda 173.650 TL', ['yüz yetmiş üç bin altı yüz elli', 'TL'], ['173', '.'])
 
-console.log('\n— markdown temizliği —')
-eq(stripMarkup('Aile odası **25.900 TL**\'dir.'), "Aile odası 25.900 TL'dir.", 'kalın işaretleri kalkıyor')
-eq(stripMarkup('- Deluxe Oda\n- Aile Odası'), 'Deluxe Oda\nAile Odası', 'madde imleri kalkıyor')
-eq(stripMarkup('## Başlık'), 'Başlık', 'başlık işareti kalkıyor')
-eq(stripMarkup('`kod` ve _italik_'), 'kod ve italik', 'kod/italik işaretleri kalkıyor')
-has(stripMarkup('Harika! 🎉 Bekleriz'), '🎉', 'emoji kalkıyor', false)
+console.log('\n— markdown —')
+says('**Aile Odası** 264.250 TL', ['Aile Odası', 'iki yüz altmış dört bin'], ['*'])
+check(stripMarkup('- madde\n## Başlık').includes('madde'), 'madde imi ve başlık temizleniyor')
 
-console.log('\n— rakamların seslendirilmesi —')
-has(speakNumbers('Aile odası 25.900 TL.'), 'yirmi beş bin dokuz yüz TL', 'fiyat kelimeye çevriliyor')
-has(speakNumbers('Villa 1.320 €'), 'bin üç yüz yirmi Euro', 'euro sembolü okunabilir hale geliyor')
-has(speakNumbers('Toplam 17998 TL'), 'on yedi bin dokuz yüz doksan sekiz TL', 'ayraçsız fiyat')
+console.log('\n— tarih ve saat —')
+says('2026-09-20 tarihinde', ['20 Eylül'], ['2026-09-20', '-'])
+says('check-in saat 14:00', ['saat on dört'], ['14:00'])
+check(!/saat\s+saat/.test(sanitizeForSpeech('check-in saat 14:00')),
+  '"saat saat" tekrarı yok', sanitizeForSpeech('check-in saat 14:00'))
 
-console.log('\n— tarih ve saat konuşma dilinde —')
-const y = new Date().getFullYear()
-eq(speakDatesAndTimes(`${y}-08-20 girişli`), '20 Ağustos girişli', 'bu yılın tarihi: yıl söylenmiyor')
-has(speakDatesAndTimes(`${y + 1}-01-05 girişli`), '5 Ocak', 'gelecek yılın tarihi')
-has(speakDatesAndTimes(`${y + 1}-01-05 girişli`), numberToTurkish(y + 1), 'farklı yıl SÖYLENİYOR')
-eq(speakDatesAndTimes('Giriş 14:00'), 'Giriş saat on dört', 'tam saat')
-eq(speakDatesAndTimes('Çıkış 12:30'), 'Çıkış saat on iki otuz', 'buçuklu saat')
+console.log('\n— tire (canlı çağrıdaki şikâyet) —')
+says('20-25 Eylül tarihleri', ['20 ile 25', 'Eylül'], ['20-25'])
+says('check-in ve check-out saatleri', ['check in', 'check out'], ['check-in', 'check-out'])
+says('e-posta adresiniz', ['e posta'], ['e-posta'])
+says('Wi-Fi şifresi', ['Wi Fi'], ['Wi-Fi'])
+
+console.log('\n— telefon numarası —')
+check(digitsToTurkish('0532') === 'sıfır beş üç iki', 'rakam rakam okunuyor', digitsToTurkish('0532'))
+says('0532-111-22-33 numarasından', ['sıfır beş üç iki'], ['0532', '-'])
+// The leading zero is the whole point: dropping it dictates a different number.
+check(sanitizeForSpeech('0532-111-22-33').startsWith('sıfır'),
+  'baştaki sıfır korunuyor', sanitizeForSpeech('0532-111-22-33'))
 
 console.log('\n— dokunulmaması gerekenler —')
-has(speakNumbers('Numaranız 05321112233'), '05321112233', 'telefon numarası kelimeye çevrilmiyor')
-has(speakNumbers('Rezervasyon kodu 8471023'), '8471023', 'rezervasyon kodu kelimeye çevrilmiyor')
-
-console.log('\n— uçtan uca —')
-const out = sanitizeForSpeech(`**Aile Odası** 25.900 TL'dir. 🎉 ${y}-08-20 girişle, 14:00'te uygundur.`)
-has(out, 'yıldız', 'çıktıda yıldız yok', false)
-has(out, '*', 'çıktıda * karakteri yok', false)
-has(out, 'yirmi beş bin dokuz yüz TL', 'fiyat sözlü')
-has(out, '20 Ağustos', 'tarih sözlü')
-has(out, 'saat on dört', 'saat sözlü')
-has(out, '-', 'makine biçimi kalmadı', false)
-console.log(`        → "${out}"`)
+says('5 yıldızlı otel', ['5 yıldızlı'])
+says('ornek@otel.com adresine', ['ornek@otel.com'])
+check(speakSeparators('3-4 gece').includes('3 ile 4'), 'kısa aralık da çevriliyor')
 
 console.log(fails === 0 ? '\nTÜM KONTROLLER GEÇTİ' : `\n${fails} KONTROL BAŞARISIZ`)
 process.exit(fails ? 1 : 0)

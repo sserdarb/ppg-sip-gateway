@@ -176,6 +176,10 @@ const VAD_RMS       = parseInt(process.env.AI_VAD_RMS || '500', 10)
 // (no AEC) trips it and the AI cuts itself off mid-sentence.
 const BARGE_RMS     = parseInt(process.env.AI_BARGE_RMS || '1100', 10)
 const BARGE_MIN_MS  = parseInt(process.env.AI_BARGE_MS  || '320', 10)
+// How long our side may stay quiet with nothing captured before we check the
+// caller is still there, and before we stop holding an empty line open.
+const IDLE_NUDGE_MS   = parseInt(process.env.AI_IDLE_NUDGE_MS   || '8000', 10)
+const IDLE_HANDOFF_MS = parseInt(process.env.AI_IDLE_HANDOFF_MS || '15000', 10)
 
 LOG('providers:', JSON.stringify(providerStatus()))
 
@@ -700,11 +704,19 @@ class AiCall {
     for (let i = 0; i < payload.length; i++) { const s = ulawByteToPcm(payload[i]); sum += s * s }
     const rms = Math.sqrt(sum / Math.max(1, payload.length))
 
-    // ── While the AI is talking OR thinking: HALF-DUPLEX guard ──
+    // ── While the AI is TALKING: HALF-DUPLEX guard ──
     // The phone bridge has no echo cancellation, so the AI's own voice (and the
-    // filler) loops back as "input". While speaking/fetching/processing, only a
-    // LOUDER, SUSTAINED voice counts as a real barge-in.
-    if (this.speaking || this._pendingTts > 0 || this.busy) {
+    // filler) loops back as "input". While audio is playing, only a LOUDER,
+    // SUSTAINED voice counts as a real barge-in.
+    //
+    // "Thinking" (busy) deliberately does NOT suppress any more. A caller who
+    // answers while the agent is still fetching used to be swallowed whole:
+    // their reply never entered the buffer, and when the agent finished it
+    // heard nothing and simply waited — the call died in silence with the guest
+    // repeating themselves. Nothing is playing during that window, so there is
+    // no echo to guard against. The audio is buffered and endTurn() picks it up
+    // as soon as the current turn finishes.
+    if (this.speaking || this._pendingTts > 0) {
       if (this.speaking && rms > BARGE_RMS) {
         this.bargeMs += 20
         if (this.bargeMs >= BARGE_MIN_MS) {
@@ -752,6 +764,9 @@ class AiCall {
     const audio = Buffer.concat(this.utter)
     this.inSpeech = false; this.speechMs = 0; this.silenceMs = 0; this.utter = []
     if (ms < MIN_SPEECH_MS) return
+    // The caller is there — the idle watchdog starts over.
+    this._quietSince = null
+    this._idleNudged = false
     this.busy = true; this.cancelResponse = false
     // Occasional, varied acknowledgement while STT+LLM run. STT is fast (~0.4s)
     // so fire RARELY (~30% of longer turns) and never the same phrase twice.
@@ -1105,9 +1120,42 @@ class AiCall {
   // Drift-correcting pacer: Node timers fire late under load, which left audible
   // gaps between 20ms frames. Each tick sends as many frames as real elapsed
   // time requires (catch-up), so timer jitter no longer becomes audio jitter.
+  /**
+   * Never let a call die in silence.
+   *
+   * A guest gave their contact details, the agent had already stopped
+   * listening, and from then on NOTHING happened — the line just sat open. A
+   * phone call that stops responding is worse than one that says the wrong
+   * thing, because the guest keeps talking to no one.
+   *
+   * So when our side has been quiet with no captured speech, nudge once; if
+   * that draws nothing either, hand over to a human rather than keep an empty
+   * line open.
+   */
+  checkIdle(now) {
+    if (this.closed || this.speaking || this.busy || this.inSpeech || this._pendingTts > 0) return
+    if (!this._quietSince) return
+    const quietMs = now - this._quietSince
+
+    if (!this._idleNudged && quietMs >= IDLE_NUDGE_MS) {
+      this._idleNudged = true
+      this._quietSince = now
+      LOG(`idle ${Math.round(quietMs / 1000)}s — nudging`)
+      this.say('Efendim, orada mısınız? Sizi dinliyorum.')
+      return
+    }
+    if (this._idleNudged && !this._idleHandedOff && quietMs >= IDLE_HANDOFF_MS) {
+      this._idleHandedOff = true
+      LOG(`idle ${Math.round(quietMs / 1000)}s after nudge — handing off`)
+      this.say('Sizi duyamıyorum, bağlantıda bir sorun olabilir. Bir arkadaşıma aktarıyorum.')
+      this.dispatchAction({ type: 'transfer', department: 'reception', reason: 'caller-silent' })
+    }
+  }
+
   tick() {
     if (this.closed) return
     const now = Date.now()
+    this.checkIdle(now)
     if (!this._nextTs) this._nextTs = now
     let budget = 0
     while (this._nextTs <= now && budget < 12) {
@@ -1122,7 +1170,15 @@ class AiCall {
   _sendFrame() {
     let frame = this.playQueue.shift()
     // Only stop speaking when queue is empty AND no TTS fetch is still in flight.
-    if (!frame) { if (this.speaking && this._pendingTts === 0) this.speaking = false; frame = SILENCE_FRAME }
+    if (!frame) {
+      if (this.speaking && this._pendingTts === 0) {
+        this.speaking = false
+        // The moment the line goes quiet on our side — the idle watchdog
+        // measures from here.
+        this._quietSince = Date.now()
+      }
+      frame = SILENCE_FRAME
+    }
     const pkt = Buffer.alloc(12 + frame.length)
     pkt[0] = 0x80; pkt[1] = 0x00
     pkt.writeUInt16BE(this.seq & 0xffff, 2); this.seq = (this.seq + 1) & 0xffff
