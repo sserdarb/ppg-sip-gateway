@@ -525,7 +525,12 @@ class AiCall {
       // Measured: the agent addressed a caller as "Ahmet Bey" on a call where
       // no name had been given. Calling someone by the wrong name is worse than
       // using none, and it makes everything else it says sound invented too.
-      `\n- ⛔ MİSAFİRİN ADINI UYDURMA. Adını yalnızca misafir SÖYLEDİYSE kullan; söylemediyse isimle hitap etme, "efendim" de.` +
+      `\n- ⛔ MİSAFİRİN ADINI UYDURMA. Adını yalnızca misafir SÖYLEDİYSE kullan; söylemediyse isimle hitap etme, "efendim" de. Anlaşılmayan bir ses parçasını isim SANMA — emin değilsen "adınızı tekrar alabilir miyim?" de.` +
+      // A live call ended with "Deluxe Oda'yı ... ayırtıyorum" — it cannot book.
+      // It creates an offer with a payment link; the room is confirmed when the
+      // guest pays. Promising a reservation it did not make is a promise the
+      // hotel has to break.
+      `\n- ⛔ REZERVASYON YAPTIĞINI SÖYLEME. "Ayırttım / rezervasyonunuzu oluşturdum / yerinizi tuttum" DEME. Sen ödeme linkli TEKLİF gönderirsin: "Teklifinizi hazırlıyorum, ödeme linkiyle birlikte gönderiyorum; ödeme tamamlanınca rezervasyonunuz kesinleşir" de.` +
       `\n- ⛔ Müsaitlik sorgusu çalışmadan "yerimiz var/müsaitiz/ayırtabiliriz" DEME.` +
       `\n- Fiyat sorulunca önce tarih + kişi sayısı + çocuk yaşını tamamla, sonra sorguyu çalıştır.` +
       `\n- Kart numarası/CVV ASLA isteme; ödeme sadece güvenli link ile.` +

@@ -158,6 +158,54 @@ const STT_IMPL = {
 }
 
 /**
+ * Whisper INVENTS text when it is given silence or line noise, and it invents
+ * the same things every time: the subtitle credits and sign-off phrases that
+ * saturate its training data. On a live call one of these came back as
+ * "Altyazı M.K." and the agent addressed the guest as "Sayın M.K." for the
+ * rest of the conversation.
+ *
+ * These are matched against the WHOLE utterance — a caller who genuinely says
+ * "teşekkürler" mid-sentence must not be silenced, only a turn that consists of
+ * nothing but the artefact.
+ */
+const STT_HALLUCINATIONS = [
+  /^alt\s*yazi/,                  // "Altyazı M.K.", "Altyazı: ..."
+  /^abone ol/,                    // "Abone olmayı unutmayın"
+  /izlediginiz icin tesekkur/,
+  /bir sonraki (video|bolum)/,
+  /kanalima abone/,
+  /^subtitles? by/,
+  /^thanks? for watching/,
+  /^please subscribe/,
+  /^amara\.org/,
+  /^[.…·♪♫\-\s]+$/,               // punctuation- or music-only output
+]
+
+/**
+ * Turkish-aware fold. `ı` is not a JS word character (so `\b` misfires around
+ * it) and `İ` does not lowercase to `i` under the `i` flag — matching Turkish
+ * with plain regexes silently fails, which is exactly how the first version of
+ * this filter passed its own tests and still let "Altyazı M.K." through.
+ */
+function foldTurkish(s) {
+  return String(s)
+    .replace(/İ/g, 'i').replace(/I/g, 'ı')
+    .toLowerCase()
+    .replace(/[ıİ]/g, 'i').replace(/ğ/g, 'g').replace(/ü/g, 'u')
+    .replace(/ş/g, 's').replace(/ö/g, 'o').replace(/ç/g, 'c')
+}
+
+/** True when the utterance is only a known artefact, not speech. */
+function isHallucinatedTranscript(text) {
+  const t = String(text || '').trim()
+  if (!t) return false
+  // Long utterances are real speech even if they open with a matching phrase.
+  if (t.length > 60) return false
+  const folded = foldTurkish(t)
+  return STT_HALLUCINATIONS.some(re => re.test(folded))
+}
+
+/**
  * Transcribe one captured utterance.
  * @param {Buffer} ulawFrames  raw µ-law RTP payload
  * @param {object} opts        { language?: 'tr', vocabulary?: string[] }
@@ -173,7 +221,13 @@ async function transcribe(ulawFrames, opts = {}) {
     if (!impl || !impl.enabled()) continue
     try {
       const res = await impl.run(wav, { language, vocabulary })
-      if (res && res.text) return { ...res, provider: name }
+      if (res && res.text) {
+        if (isHallucinatedTranscript(res.text)) {
+          LOG(`stt ${name} returned a known silence artefact — discarded: ${JSON.stringify(res.text)}`)
+          return { text: '', language, provider: name }
+        }
+        return { ...res, provider: name }
+      }
     } catch (e) {
       lastErr = e
       LOG(`stt ${name} failed: ${e.message} — next provider`)
@@ -625,6 +679,6 @@ function providerStatus() {
 
 module.exports = {
   transcribe, synthesize, chatStream, chatJson, emitSentences,
-  buildVocabulary, providerStatus,
+  buildVocabulary, providerStatus, isHallucinatedTranscript,
   GROQ_LLM_FALLBACK, GROQ_LLM_MODEL,
 }
