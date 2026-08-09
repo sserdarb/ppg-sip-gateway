@@ -54,10 +54,35 @@ says('0532-111-22-33 numarasından', ['sıfır beş üç iki'], ['0532', '-'])
 check(sanitizeForSpeech('0532-111-22-33').startsWith('sıfır'),
   'baştaki sıfır korunuyor', sanitizeForSpeech('0532-111-22-33'))
 
+console.log('\n— cümleye bölme (fiyatı ikiye bölüyordu) —')
+{
+  const { emitSentences } = require('./providers')
+  const collect = async (text) => {
+    const out = []
+    const rest = await emitSentences(text, (s) => { out.push(s) }, () => false)
+    return { out, rest }
+  }
+  // The live failure: "160.280" was cut at the thousands separator, and the
+  // orphaned "160." was spoken as an ordinal — "yüz altmışINCI".
+  collect('Aile Odası 160.280 TL. Başka sorunuz var mı?').then(({ out }) => {
+    check(!out.some(s => /\d\.$/.test(s.trim())),
+      'binlik ayıracından bölmüyor', JSON.stringify(out))
+    check(out.some(s => s.includes('160.280')),
+      'fiyat tek parça kalıyor', JSON.stringify(out))
+    check(out.length === 2, 'gerçek cümle sonları hâlâ bölünüyor', `${out.length} cümle`)
+
+    // And end to end: the whole sentence must speak as words.
+    const spoken = sanitizeForSpeech(out[0] || '')
+    check(spoken.includes('yüz altmış bin iki yüz seksen') && !spoken.includes('160'),
+      'bölünmeyen fiyat kelimeye çevriliyor', spoken)
+
+    console.log(fails === 0 ? '\nTÜM KONTROLLER GEÇTİ' : `\n${fails} KONTROL BAŞARISIZ`)
+    process.exit(fails ? 1 : 0)
+  })
+}
+
 console.log('\n— dokunulmaması gerekenler —')
 says('5 yıldızlı otel', ['5 yıldızlı'])
 says('ornek@otel.com adresine', ['ornek@otel.com'])
 check(speakSeparators('3-4 gece').includes('3 ile 4'), 'kısa aralık da çevriliyor')
-
-console.log(fails === 0 ? '\nTÜM KONTROLLER GEÇTİ' : `\n${fails} KONTROL BAŞARISIZ`)
-process.exit(fails ? 1 : 0)
+// Result is reported by the async sentence-splitting block above.

@@ -492,12 +492,22 @@ function llmChain() {
   return LLM_ORDER.flatMap(v => (byVendor[v] ? byVendor[v]() : []))
 }
 
-/** Emit each COMPLETE sentence from `pending` via onSentence(); return leftover. */
+/**
+ * Emit each COMPLETE sentence from `pending` via onSentence(); return leftover.
+ *
+ * A period between digits is a THOUSANDS SEPARATOR, not a full stop. Splitting
+ * there cut "160.280 TL" into "…160." and "280 TL", and the speech engine read
+ * the orphaned "160." as an ordinal — the caller heard "yüz altmışINCI iki yüz
+ * seksen". The number never even reached the spell-out pass, because by then it
+ * was two different chunks.
+ */
+const SENTENCE_END = /^([\s\S]*?(?:[!?…]+|(?<!\d)\.+|\.+(?!\d)))([\s\S]*)$/
+
 async function emitSentences(pending, onSentence, shouldStop) {
   let out = pending
   while (true) {
     if (shouldStop && shouldStop()) return out
-    const m = out.match(/^([\s\S]*?[.!?…]+)([\s\S]*)$/)
+    const m = out.match(SENTENCE_END)
     if (!m) break
     const sentence = m[1].trim()
     out = m[2]
