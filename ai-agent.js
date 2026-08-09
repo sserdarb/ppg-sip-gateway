@@ -15,6 +15,7 @@ const os = require('os')
 
 const { ulawByteToPcm } = require('./audio')
 const { transcribe, synthesize, chatStream, buildVocabulary, providerStatus } = require('./providers')
+const { sanitizeForSpeech } = require('./speech')
 const { classifyIntent, intentDirective } = require('./intent-router')
 
 function detectIp() {
@@ -492,7 +493,10 @@ class AiCall {
       // 25.900 it produced "iki beş bin doksan yüz TL" — gibberish, and it is
       // MONEY. The TTS engine reads Turkish numerals correctly on its own, so
       // the model's job is to copy the digits exactly and nothing more.
-      `\n3) Fiyatı listedeki RAKAMLA yaz ("25.900 TL"). Rakamı kelimeye ÇEVİRME, yuvarlama, değiştirme — okumayı sistem yapar.` +
+      `\n3) Fiyatı listedeki RAKAMLA yaz ("25.900 TL"). Rakamı kelimeye ÇEVİRME, yuvarlama, değiştirme — seslendirmeyi sistem yapar.` +
+      // The engine reads "**" aloud as "yıldız yıldız". Belt and braces: the
+      // gateway strips markup before speaking, but the model should not emit it.
+      `\n3b) DÜZ METİN yaz. Yıldız (*), alt çizgi, tire-madde, başlık, tablo, emoji KULLANMA — hepsi sesli okunuyor.` +
       `\n4) Misafir soru sorarsa önce ona cevap ver. Kendini tekrarlama.` +
       // The same closing question three turns running is what a caller hears as
       // a robot. Measured on three consecutive answers: all ended "Başka bir
@@ -560,7 +564,17 @@ class AiCall {
       `\n- Sıcak ve insani ol; söylediğine gerçekten tepki ver, duygusuz bilgi aktarma.` +
       `\n- Kendi cümlelerini kur, ezber kalıp okuma. Aynı şeyi tekrar söylemen gerekirse başka kelimelerle söyle.` +
       `\n- Bu konuşmada kullandığın onay kelimelerini ("Tabii", "Anladım", "Elbette") tekrar kullanma; çoğu zaman hiç kullanma, doğrudan konuya gir.` +
-      `\n- Konuşma dili kullan. Madde işareti, liste, başlık, emoji YOK.`
+      `\n- Konuşma dili kullan. Madde işareti, liste, başlık, emoji YOK.` +
+
+      // Register: a hotel line is hospitality, not a database lookup. The
+      // difference a caller hears is whether their request was acknowledged
+      // before it was answered.
+      `\n\nİLETİŞİM DİLİ (soru sorulduğunda / bir şey istendiğinde):` +
+      `\n- Önce TALEBİ KARŞILA, sonra cevabı ver: "Memnuniyetle bakayım efendim." / "Tabii, hemen ilgileniyorum." gibi KISA bir kabul cümlesi — ama her turda değil, aynısını tekrarlamadan.` +
+      `\n- Nazik ve saygılı ol: "Siz" dili, "efendim", "rica ederim", "teşekkür ederim". Emir kipi kullanma; "söyleyin" yerine "paylaşabilir misiniz", "bekleyin" yerine "hatta kalabilir misiniz" de.` +
+      `\n- Bir şey isteyeceksen GEREKÇESİNİ söyle: "Size doğru fiyatı verebilmem için giriş tarihinizi alabilir miyim?" — sebepsiz bilgi istemek sorgu gibi hissettirir.` +
+      `\n- Olumsuz cevabı yumuşat ve mutlaka bir alternatif sun; "yapamam/yok" ile cümle bitirme.` +
+      `\n- Misafir teşekkür ederse karşılık ver, özür dilerse rahatlat. Duyguya duyguyla cevap ver, bilgiyle değil.`
 
     // Real-call examples for THIS intent (falls back to the generic pack).
     const pack = this._fewShot
@@ -1047,8 +1061,13 @@ class AiCall {
   // Non-blocking: kicks off TTS fetch immediately (parallel with previous
   // sentences still playing), then chains the queue-push so sentences stay in
   // order. This eliminates the inter-sentence silence gap of sequential fetching.
-  say(text) {
-    if (this.closed || !text) return
+  say(rawText) {
+    if (this.closed || !rawText) return
+    // Between the model and the speech engine: strip markdown (the agent was
+    // literally saying "yıldız yıldız" for **bold**) and spell amounts out in
+    // Turkish (they were coming through digit by digit).
+    const text = sanitizeForSpeech(rawText)
+    if (!text) return
     const profile = this.currentProfile
     this._pendingTts++
     // Start the network fetch RIGHT NOW — before the previous sentence finishes.
