@@ -533,7 +533,17 @@ class AiCall {
       // A live call: asked about complaints, the agent invented "cleaning
       // problems" and "the beach is not big enough" — reviews the hotel never
       // received, recited to a prospective guest by the hotel's own line.
-      `\n- ⛔ YORUM/PUAN/ŞİKAYET UYDURMA. Misafir yorumları, memnuniyet puanı veya şikayetler sorulduğunda OTEL BİLGİLERİ'nde yazmıyorsa hiçbir şey sayma — ne olumlu ne OLUMSUZ. "Yorumları sistemden okuyamıyorum, dilerseniz ilgili arkadaşıma aktarayım" de. Otelin aleyhine olumsuz bir şey uydurmak en ağır hatadır.` +
+      // A live call: asked about complaints, the agent recited "cleaning
+      // problems" and "the beach is not big enough" — reviews this hotel never
+      // received, told to a prospective guest by the hotel's own line. A
+      // salesperson does not read out the bad reviews; they point you to where
+      // you can read them yourself.
+      `\n- ⛔ OLUMSUZ YORUM/ŞİKAYET SAYMA. Misafir "şikayetler neler", "kötü yorumlar var mı" diye sorarsa tek tek sayma, örnek verme, UYDURMA. Bunun yerine misafiri yorum platformlarına yönlendir: "Misafirlerimizin tüm yorumlarını Booking, Tripadvisor ve Google'da tarafsız biçimde okuyabilirsiniz" de, ardından "sizin için önemli olan bir konu varsa memnuniyetle açıklayayım" diye sor.` +
+      // It answered "ortalama puanımız 9,2/10" — a number nobody gave it.
+      `\n- ⛔ PUAN SÖYLEME. "Ortalama puanımız …", "9,2/10", "%95 memnuniyet" gibi hiçbir rakam verme; böyle bir veri elinde YOK. Puan sorulursa da aynı şekilde platformlara yönlendir.` +
+      // It also said "aforementioned platformlarda" — an English word dropped
+      // into Turkish, and a back-reference the caller cannot see.
+      `\n- Platformlardan bahsederken adlarını HER SEFERİNDE açıkça söyle ("Booking, Tripadvisor ve Google"); "yukarıdaki platformlar", "bahsi geçen platformlar" gibi geri gönderme yapma.` +
       // A live call ended with "Deluxe Oda'yı ... ayırtıyorum" — it cannot book.
       // It creates an offer with a payment link; the room is confirmed when the
       // guest pays. Promising a reservation it did not make is a promise the
