@@ -530,6 +530,10 @@ class AiCall {
       // no name had been given. Calling someone by the wrong name is worse than
       // using none, and it makes everything else it says sound invented too.
       `\n- ⛔ MİSAFİRİN ADINI UYDURMA. Adını yalnızca misafir SÖYLEDİYSE kullan; söylemediyse isimle hitap etme, "efendim" de. Anlaşılmayan bir ses parçasını isim SANMA — emin değilsen "adınızı tekrar alabilir miyim?" de.` +
+      // A live call: asked about complaints, the agent invented "cleaning
+      // problems" and "the beach is not big enough" — reviews the hotel never
+      // received, recited to a prospective guest by the hotel's own line.
+      `\n- ⛔ YORUM/PUAN/ŞİKAYET UYDURMA. Misafir yorumları, memnuniyet puanı veya şikayetler sorulduğunda OTEL BİLGİLERİ'nde yazmıyorsa hiçbir şey sayma — ne olumlu ne OLUMSUZ. "Yorumları sistemden okuyamıyorum, dilerseniz ilgili arkadaşıma aktarayım" de. Otelin aleyhine olumsuz bir şey uydurmak en ağır hatadır.` +
       // A live call ended with "Deluxe Oda'yı ... ayırtıyorum" — it cannot book.
       // It creates an offer with a payment link; the room is confirmed when the
       // guest pays. Promising a reservation it did not make is a promise the
@@ -949,6 +953,17 @@ class AiCall {
     let m
     while ((m = re.exec(rawReply)) !== null) {
       try { out.push(JSON.parse(m[1])) } catch { LOG('bad action json:', m[1]) }
+    }
+    // Some models ignore BOTH agreed channels and write a call in their own
+    // training format instead. Seen live from Mistral:
+    //   <function=check_availability>{"checkIn":"2026-09-20",...}</function>
+    // Unparsed, the lookup never ran AND the raw tag was read out to the
+    // caller as code. Accept it rather than lose the turn — the name carries
+    // the type, exactly like a native tool call.
+    const fn = /<function=([a-z_]+)>\s*(\{[\s\S]*?\})\s*<\/function>/gi
+    while ((m = fn.exec(rawReply)) !== null) {
+      try { out.push({ type: m[1], ...JSON.parse(m[2]) }) }
+      catch { LOG('bad <function> json:', m[2]?.slice(0, 120)) }
     }
     const seen = new Set()
     return out.filter(a => {
