@@ -1121,7 +1121,9 @@ class AiCall {
     // Between the model and the speech engine: strip markdown (the agent was
     // literally saying "yıldız yıldız" for **bold**) and spell amounts out in
     // Turkish (they were coming through digit by digit).
-    const text = sanitizeForSpeech(rawText)
+    // The speech rules follow the VOICE, not the hotel: a German caller must
+    // hear "Halbpension" and "bis", not the Turkish forms.
+    const text = sanitizeForSpeech(rawText, this.currentProfile.whisperCode)
     if (!text) return
     const profile = this.currentProfile
     this._pendingTts++
