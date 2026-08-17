@@ -105,8 +105,10 @@ function stripMarkup(text) {
 }
 
 // ── numbers in context ──────────────────────────────────────────────────────
+// "TL" was left as-is and the engine read it "te le". The word a Turkish
+// speaker uses for the amount is "lira".
 const CURRENCY_WORD = {
-  'tl': 'TL', '₺': 'TL', 'try': 'TL',
+  'tl': 'lira', '₺': 'lira', 'try': 'lira',
   '€': 'Euro', 'eur': 'Euro', 'euro': 'Euro',
   '$': 'Dolar', 'usd': 'Dolar',
 }
@@ -144,6 +146,62 @@ function speakDatesAndTimes(text) {
         : `${numberToTurkish(hour)} ${numberToTurkish(min)}`
       return pre ? `${pre}${body}` : `saat ${body}`
     })
+}
+
+/**
+ * Hotel jargon, said the way a receptionist says it.
+ *
+ * The engine spelled "SPA" out as "S-P-A" — it reads a short all-caps token as
+ * an initialism, which is right for PNR and wrong for spa. And the board codes
+ * are worse than mispronounced: "UAI" read as three letters means nothing to a
+ * guest, while "ultra her şey dahil" is the actual product being sold.
+ *
+ * So every abbreviation this business uses is listed here with what a person
+ * would SAY, rather than patched one complaint at a time. Order matters —
+ * longer codes first, so UAI is not consumed by AI.
+ */
+const ABBREVIATIONS = [
+  // Board / concept codes. These are products, not letters.
+  [/\bU\.?A\.?L\.?L\b/gi, 'ultra her şey dahil'],
+  [/\bU\.?A\.?I\b/gi, 'ultra her şey dahil'],
+  [/\bA\.?L\.?L\b(?!\s*[a-zçğıöşü])/g, 'her şey dahil'],
+  [/\bA\.?I\b(?![-\s]*(?:destek|asistan|yapay))/g, 'her şey dahil'],
+  [/\bH\.?B\b/g, 'yarım pansiyon'],
+  [/\bF\.?B\b/g, 'tam pansiyon'],
+  [/\bB\.?B\b/g, 'oda kahvaltı'],
+  [/\bR\.?O\b/g, 'sadece oda'],
+  [/\bO\.?B\b/g, 'sadece oda'],
+  // Facilities the engine either spells out or reads in English.
+  [/\bSPA\b/g, 'spa'],
+  [/\bWi[-\s]?Fi\b/gi, 'vay fay'],
+  [/\bWIFI\b/g, 'vay fay'],
+  [/\bT\.?V\b/g, 'televizyon'],
+  [/\bW\.?C\b/g, 'tuvalet'],
+  [/\bA\/?C\b/g, 'klima'],
+  [/\bF\s*&\s*B\b/gi, 'yiyecek içecek'],
+  [/\bVIP\b/g, 'vip'],
+  // Operations vocabulary.
+  [/\bPAX\b/gi, 'kişi'],
+  [/\bC\s*\/\s*In\b/gi, 'giriş'],
+  [/\bC\s*\/\s*Out\b/gi, 'çıkış'],
+  [/\bcheck[-\s]?in\b/gi, 'çekin'],
+  [/\bcheck[-\s]?out\b/gi, 'çekaut'],
+  [/\bno[-\s]?show\b/gi, 'gelmeme'],
+  [/\bstop\s*sale\b/gi, 'satışa kapalı'],
+  // No \b before "à": it is not an ASCII word character, so the boundary never
+  // matches — the same trap that broke the Turkish intent regexes.
+  [/(?<![\p{L}])[aà]\s*la\s*carte(?![\p{L}])/giu, 'alakart'],
+  // Units.
+  [/\bm²|\bm2\b/g, 'metrekare'],
+  [/(\d)\s*km\b/g, '$1 kilometre'],
+  [/(\d)\s*mt?\b(?![a-zçğıöşü])/g, '$1 metre'],
+  [/(\d)\s*\*/g, '$1 yıldız'],
+]
+
+function expandAbbreviations(text) {
+  let out = String(text || '')
+  for (const [re, word] of ABBREVIATIONS) out = out.replace(re, word)
+  return out
 }
 
 /** Digit-by-digit, the way a person reads a number back to confirm it. */
@@ -233,7 +291,11 @@ function sanitizeForSpeech(text) {
   // Order is load-bearing: ISO dates own their hyphens, so they must become
   // words BEFORE the separator pass; phones must be spelled there before the
   // number pass can mistake a group for a quantity.
-  return speakNumbers(speakSeparators(speakDatesAndTimes(stripMarkup(stripMachineSyntax(text)))))
+  // Abbreviations expand BEFORE the separator pass, so "Wi-Fi" and "C/In" are
+  // already words by the time hyphens and slashes are dealt with.
+  return speakNumbers(speakSeparators(
+    expandAbbreviations(speakDatesAndTimes(stripMarkup(stripMachineSyntax(text)))),
+  ))
     // Turkish attaches suffixes to NUMERALS with an apostrophe ("14:00'te"),
     // but once the numeral is a word the apostrophe is wrong and the engine
     // stumbles on it: "on dört'te" should simply be "on dörtte". Dropping it
@@ -245,5 +307,6 @@ function sanitizeForSpeech(text) {
 
 module.exports = {
   sanitizeForSpeech, stripMarkup, stripMachineSyntax, speakNumbers,
-  speakDatesAndTimes, speakSeparators, numberToTurkish, digitsToTurkish,
+  speakDatesAndTimes, speakSeparators, expandAbbreviations,
+  numberToTurkish, digitsToTurkish, ABBREVIATIONS,
 }

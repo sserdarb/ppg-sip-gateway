@@ -29,7 +29,8 @@ console.log('— sayılar —')
 check(numberToTurkish(25900) === 'yirmi beş bin dokuz yüz', 'yirmi beş bin dokuz yüz', numberToTurkish(25900))
 check(numberToTurkish(1000) === 'bin', '"bir bin" değil "bin"', numberToTurkish(1000))
 check(numberToTurkish(173650) === 'yüz yetmiş üç bin altı yüz elli', '173.650', numberToTurkish(173650))
-says('Deluxe Oda 173.650 TL', ['yüz yetmiş üç bin altı yüz elli', 'TL'], ['173', '.'])
+// "TL" is spoken "lira" — the engine read the two letters as "te le".
+says('Deluxe Oda 173.650 TL', ['yüz yetmiş üç bin altı yüz elli', 'lira'], ['173', '.'])
 
 console.log('\n— markdown —')
 says('**Aile Odası** 264.250 TL', ['Aile Odası', 'iki yüz altmış dört bin'], ['*'])
@@ -43,9 +44,11 @@ check(!/saat\s+saat/.test(sanitizeForSpeech('check-in saat 14:00')),
 
 console.log('\n— tire (canlı çağrıdaki şikâyet) —')
 says('20-25 Eylül tarihleri', ['20 ile 25', 'Eylül'], ['20-25'])
-says('check-in ve check-out saatleri', ['check in', 'check out'], ['check-in', 'check-out'])
+// These now go through the abbreviation layer, which gives the Turkish spoken
+// form rather than merely dropping the hyphen (see test_abbrev.js).
+says('check-in ve check-out saatleri', ['çekin', 'çekaut'], ['check-in', 'check-out'])
 says('e-posta adresiniz', ['e posta'], ['e-posta'])
-says('Wi-Fi şifresi', ['Wi Fi'], ['Wi-Fi'])
+says('Wi-Fi şifresi', ['vay fay'], ['Wi-Fi'])
 
 console.log('\n— telefon numarası —')
 check(digitsToTurkish('0532') === 'sıfır beş üç iki', 'rakam rakam okunuyor', digitsToTurkish('0532'))
