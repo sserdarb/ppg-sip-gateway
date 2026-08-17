@@ -36,8 +36,12 @@ const WHISPER_URL = (process.env.WHISPER_URL || 'http://161.97.132.250:9009').re
 // ── models ───────────────────────────────────────────────────────────────────
 const GROQ_STT_MODEL = process.env.GROQ_STT_MODEL || 'whisper-large-v3-turbo'
 const DEEPGRAM_MODEL = process.env.DEEPGRAM_STT_MODEL || 'nova-2'
-const GROQ_LLM_MODEL = process.env.AI_LLM_MODEL_GROQ || process.env.GROQ_LLM_MODEL || 'llama-3.3-70b-versatile'
-const GROQ_LLM_FALLBACK = process.env.AI_LLM_MODEL_FALLBACK || 'llama-3.1-8b-instant'
+// Groq RETIRED the llama-3.x names we used — every call came back
+// "model_not_found" and the whole chain fell through on a live call. Measured
+// against the current catalogue: openai/gpt-oss-120b answers in ~610ms and
+// emits tool calls, -20b likewise at ~570ms; qwen3.6-27b never called a tool.
+const GROQ_LLM_MODEL = process.env.AI_LLM_MODEL_GROQ || process.env.GROQ_LLM_MODEL || 'openai/gpt-oss-120b'
+const GROQ_LLM_FALLBACK = process.env.AI_LLM_MODEL_FALLBACK || 'openai/gpt-oss-20b'
 const NVIDIA_LLM_MODEL = process.env.AI_LLM_MODEL || 'meta/llama-3.3-70b-instruct'
 const ELEVEN_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_turbo_v2_5'
 const CARTESIA_MODEL = process.env.CARTESIA_MODEL || 'sonic-2'
@@ -439,6 +443,14 @@ const OPENROUTER_MODEL = process.env.OPENROUTER_LLM_MODEL || 'meta-llama/llama-3
 // MISTRAL LEADS because a phone line needs predictable turns more than it needs
 // the last 150ms: Groq is marginally faster and cleaner but 429s for most of the
 // day, and a dead primary costs a wasted round trip on every single turn.
+// A live call found the top TWO vendors dead at once — Mistral 402
+// (subscription lapsed) and Groq 404 (the llama-3.x names were retired) — so
+// every turn paid two failed round trips before reaching one that answered.
+//
+// Both are fixed: a new Mistral key (verified: 200, clean Turkish, tool calls,
+// 50k tokens + 50 requests per minute, no daily cap) and Groq's current
+// catalogue. Mistral leads on TURKISH QUALITY — gpt-oss is the model that has
+// leaked English and CJK mid-sentence — with Groq right behind it at ~610ms.
 const LLM_ORDER = parseOrder(process.env.AI_LLM_CHAIN, 'mistral,groq,cerebras,openrouter,zhipu,nvidia')
 
 function llmChain() {
@@ -446,9 +458,18 @@ function llmChain() {
     groq: () => {
       if (!GROQ_API_KEY) return []
       const url = 'https://api.groq.com/openai/v1/chat/completions'
-      const out = [{ name: `groq:${GROQ_LLM_MODEL}`, url, key: GROQ_API_KEY, model: GROQ_LLM_MODEL }]
+      // gpt-oss are reasoning models: without this they spend the whole token
+      // budget thinking and the caller hears silence.
+      const effort = (m) => (/gpt-oss/.test(m) ? 'low' : undefined)
+      const out = [{
+        name: `groq:${GROQ_LLM_MODEL}`, url, key: GROQ_API_KEY,
+        model: GROQ_LLM_MODEL, reasoningEffort: effort(GROQ_LLM_MODEL),
+      }]
       if (GROQ_LLM_FALLBACK && GROQ_LLM_FALLBACK !== GROQ_LLM_MODEL) {
-        out.push({ name: `groq:${GROQ_LLM_FALLBACK}`, url, key: GROQ_API_KEY, model: GROQ_LLM_FALLBACK })
+        out.push({
+          name: `groq:${GROQ_LLM_FALLBACK}`, url, key: GROQ_API_KEY,
+          model: GROQ_LLM_FALLBACK, reasoningEffort: effort(GROQ_LLM_FALLBACK),
+        })
       }
       return out
     },

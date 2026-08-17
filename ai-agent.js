@@ -828,13 +828,23 @@ class AiCall {
       LOG('LLM:', JSON.stringify(reply))
       if (this.closed) { this.busy = false; return }
 
-      if (reply) {
+      // A TOOL CALL IS A COMPLETE TURN, even with no words attached.
+      //
+      // Models routinely answer "check the dates" by emitting ONLY the tool
+      // call — no prose at all. Treating an empty text reply as failure meant
+      // the lookup we had just captured was thrown away, the guest was told
+      // "anlayamadım", and two of those in a row triggered a transfer that was
+      // never warranted. On the reported call this happened three times: the
+      // agent asked for dates, got them, called the tool in its head, and then
+      // told the guest it had not understood.
+      const actions = this.parseActions(reply || '')
+      if (reply || actions.length) {
         this.noUnderstandStreak = 0
         // Offer/transfer directives fire immediately; a check_availability is
         // answered IN-LINE — run the lookup, feed the result back and let the
         // model speak the real numbers in a second pass.
-        this.runActions(reply)
-        await this.handleToolCalls(reply)
+        this.runActions(reply || '')
+        await this.handleToolCalls(reply || '')
       } else if (!this.cancelResponse) {
         await this.failedTurn()
       }

@@ -23,6 +23,51 @@ const AI_DEFAULT_HOTEL = process.env.AI_DEFAULT_HOTEL || '' // slug the 7000 ext
 const GATEWAY_SECRET = process.env.GATEWAY_SECRET || ''
 
 /**
+ * The hotel's AI config, with the last good copy kept in memory.
+ *
+ * A live call lost the lookup to a 6s timeout and the agent ran the whole
+ * conversation BLIND: no hotelId (so the availability tool and the hand-off
+ * both failed with "hotelId required"), no price list, no hotel facts. One slow
+ * response should not strip an agent of everything it knows.
+ *
+ * So: a longer budget, one retry, and a per-hotel cache that survives the
+ * failure. Yesterday's prices are far better than none — and when there is no
+ * cache either, the caller is at least handled by an agent that knows it has
+ * nothing rather than one that invents.
+ */
+const hotelConfigCache = new Map()   // key → { ai, hotelId, at }
+const didRouteCache = new Map()      // DID → { info, at }
+const CONFIG_TTL_MS = 30 * 60 * 1000
+
+async function loadHotelConfig(url, cacheKey) {
+  for (const timeout of [9000, 6000]) {
+    try {
+      const r = await apiFetch(url, {
+        headers: GATEWAY_SECRET ? { 'x-gateway-secret': GATEWAY_SECRET } : {},
+        signal: AbortSignal.timeout(timeout),
+      })
+      const j = await r.json()
+      if (j?.found) {
+        const got = { ai: j.ai, hotelId: j.hotelId, at: Date.now() }
+        hotelConfigCache.set(cacheKey, got)
+        return got
+      }
+      console.warn(`[ai] config lookup returned found=false for ${cacheKey}`)
+      break
+    } catch (e) {
+      console.error(`[ai] config fetch failed (${timeout}ms): ${e.message}`)
+    }
+  }
+  const cached = hotelConfigCache.get(cacheKey)
+  if (cached && Date.now() - cached.at < CONFIG_TTL_MS) {
+    console.warn(`[ai] using cached config for ${cacheKey} (${Math.round((Date.now() - cached.at) / 1000)}s old)`)
+    return cached
+  }
+  console.error(`[ai] NO config for ${cacheKey} — agent will run without prices or hotel facts`)
+  return { ai: null, hotelId: null }
+}
+
+/**
  * Call PPG.
  *
  * This used to rewrite every request to the internal `coolify-proxy` with a Host
@@ -485,12 +530,12 @@ class SipSession {
     const caller = (extractHeader(sip, 'From').match(/sips?:(\+?[\d]+)@/i) || [])[1] || ''
     let aiCfg = null, hotelId = null
     if (AI_DEFAULT_HOTEL) {
-      try {
-        const url = `${PPG_API_URL}/api/cc/route?hotelSlug=${encodeURIComponent(AI_DEFAULT_HOTEL)}${caller ? `&caller=${encodeURIComponent(caller)}` : ''}`
-        const r = await apiFetch(url, { headers: GATEWAY_SECRET ? { 'x-gateway-secret': GATEWAY_SECRET } : {}, signal: AbortSignal.timeout(6000) })
-        const j = await r.json()
-        if (j?.found) { aiCfg = j.ai; hotelId = j.hotelId }
-      } catch (e) { console.error('[ai] config fetch failed:', e.message) }
+      const got = await loadHotelConfig(
+        `${PPG_API_URL}/api/cc/route?hotelSlug=${encodeURIComponent(AI_DEFAULT_HOTEL)}${caller ? `&caller=${encodeURIComponent(caller)}` : ''}`,
+        AI_DEFAULT_HOTEL,
+      )
+      aiCfg = got.ai
+      hotelId = got.hotelId
     }
 
     // 5) Start the voice agent (PCMU RTP via rtpengine ↔ STT/LLM/TTS).
@@ -577,17 +622,25 @@ async function handleInboundInvite(sip, rinfo) {
     return
   }
 
-  // PPG DID lookup
+  // PPG DID lookup — same budget and last-good-copy fallback as the extension
+  // path, so one slow response cannot drop a real inbound call.
   let routeInfo = null
   try {
     const url = `${PPG_API_URL}/api/cc/route?did=${encodeURIComponent(did)}${caller ? `&caller=${encodeURIComponent(caller)}` : ''}`
     const fetchHeaders = GATEWAY_SECRET ? { 'x-gateway-secret': GATEWAY_SECRET } : {}
-    const r = await apiFetch(url, { headers: fetchHeaders, signal: AbortSignal.timeout(6000) })
+    const r = await apiFetch(url, { headers: fetchHeaders, signal: AbortSignal.timeout(9000) })
     routeInfo = await r.json()
+    if (routeInfo?.found) didRouteCache.set(did, { info: routeInfo, at: Date.now() })
   } catch (e) {
     console.error('[inbound] PPG lookup failed:', e.message)
-    udp.send(Buffer.from(buildUdpResponse(sip, 503, 'Service Unavailable')), rinfo.port, rinfo.address)
-    return
+    const cached = didRouteCache.get(did)
+    if (cached && Date.now() - cached.at < CONFIG_TTL_MS) {
+      console.warn(`[inbound] using cached route for ${did} (${Math.round((Date.now() - cached.at) / 1000)}s old)`)
+      routeInfo = cached.info
+    } else {
+      udp.send(Buffer.from(buildUdpResponse(sip, 503, 'Service Unavailable')), rinfo.port, rinfo.address)
+      return
+    }
   }
 
   if (!routeInfo?.found) {
