@@ -11,7 +11,7 @@
 // is byte-for-byte what it was before.
 //
 //   AI_STT_ORDER   default "deepgram,groq,whisper"
-//   AI_TTS_ORDER   default "elevenlabs,cartesia,groq,google"
+//   AI_TTS_ORDER   default "piper,elevenlabs,cartesia,groq,google"
 //
 // LLM model choice (Groq): llama-3.3-70b-versatile (default, current prod),
 // llama-3.1-8b-instant (router / cheap turns), qwen-2.5-72b-instruct and
@@ -19,7 +19,11 @@
 // grammar + tool-call stability. Set AI_LLM_MODEL_GROQ to switch, and
 // AI_LLM_MODEL_FALLBACK for the second attempt on a 429/5xx.
 
-const { ulawToWav, wavToUlaw, pcm16ToUlaw } = require('./audio')
+const { ulawToWav, wavToUlaw, pcm16ToUlaw, resamplePcm16 } = require('./audio')
+const { spawn } = require('child_process')
+const fs = require('fs')
+const os = require('os')
+const path = require('path')
 
 const LOG = (...a) => console.log('[providers]', ...a)
 
@@ -48,7 +52,7 @@ const CARTESIA_MODEL = process.env.CARTESIA_MODEL || 'sonic-2'
 
 const parseOrder = (v, def) => (v || def).split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
 const STT_ORDER = parseOrder(process.env.AI_STT_ORDER, 'deepgram,groq,whisper')
-const TTS_ORDER = parseOrder(process.env.AI_TTS_ORDER, 'elevenlabs,cartesia,groq,google')
+const TTS_ORDER = parseOrder(process.env.AI_TTS_ORDER, 'piper,elevenlabs,cartesia,groq,google')
 
 /** Parse a JSON env map; `{}` on anything unparseable so a typo can't crash a call. */
 function jsonEnv(name) {
@@ -359,10 +363,134 @@ async function googleTts(text, { lang, voiceName }) {
   return Buffer.from(j.audioContent, 'base64')
 }
 
+/**
+ * Piper — YEREL Türkçe ses (açık kaynak, sunucuda çalışır; ses verisi dışarı çıkmaz, ücretsiz).
+ * 9 Kas 2026: Groq'ta Türkçe ses yok, Google TTS faturalandırması kapalı → ajan Türkçe tek kelime
+ * söyleyemiyordu. Piper ham 16 bit PCM üretir (model JSON'undaki örnekleme hızında) → 8 kHz µ-law.
+ */
+const PIPER_BIN = process.env.PIPER_BIN || '/opt/piper/piper'
+const PIPER_MODELLER = { tr: process.env.PIPER_MODEL_TR || '/opt/piper-sesler/tr_TR-dfki-medium.onnx' }
+const piperHiz = new Map()
+function piperModel(lang) {
+  const yol = PIPER_MODELLER[(lang || 'tr-TR').slice(0, 2)]
+  if (!yol || !fs.existsSync(yol)) return null
+  if (!piperHiz.has(yol)) {
+    let hiz = 22050
+    try { hiz = JSON.parse(fs.readFileSync(`${yol}.json`, 'utf8')).audio.sample_rate || 22050 } catch {}
+    piperHiz.set(yol, hiz)
+  }
+  return { yol, hiz: piperHiz.get(yol) }
+}
+
+// Konuşma hızı: Piper'da length_scale KÜÇÜK = DAHA HIZLI (1.0 modelin doğal hızı).
+const PIPER_LENGTH_SCALE = process.env.PIPER_LENGTH_SCALE || '0.9'
+// İsteğe bağlı doğallık ayarları (boş = modelin kendi değeri): noise_scale ↑ daha canlı/değişken,
+// noise_w ↑ daha serbest ritim. Aşırı değerlerde ses bozulur; 0.5–0.9 arası güvenli.
+const PIPER_NOISE_SCALE = process.env.PIPER_NOISE_SCALE || ''
+const PIPER_NOISE_W = process.env.PIPER_NOISE_W || ''
+
+/**
+ * Okunuş sözlüğü (YALNIZ Piper). Piper'ın Türkçe fonemleştiricisi yabancı yazımı Türkçe harf
+ * kurallarıyla okur: "Belconti" → "Beldjonti" (c = dj), "Resort" → "Resort" (t sesli). Bu yüzden
+ * adlar Türkçe harflerle, söylendiği gibi yazılır. Bulut sesleri (Google/ElevenLabs) adları kendisi
+ * doğru okuduğu için onlara dokunulmaz. Ek giriş: PIPER_LEXICON_TR = JSON {"Ad":"okunuş"}.
+ */
+const PIPER_LEKSIKON_TR = {
+  'Belconti': 'Belkonti',
+  'Blue Dreams': 'Blu Drimz',
+  'Resort': 'Rizort',
+  'Cristal': 'Kristal',
+  'Beach Club': 'Biç Klab',
+  'All Inclusive': 'Ol İnklusiv',
+  'Ultra All Inclusive': 'Ultra Ol İnklusiv',
+  'Wi-Fi': 'Vay Fay',
+}
+try { Object.assign(PIPER_LEKSIKON_TR, JSON.parse(process.env.PIPER_LEXICON_TR || '{}')) } catch { /* bozuk JSON → varsayılanlar */ }
+const PIPER_LEKSIKON_SIRALI = Object.entries(PIPER_LEKSIKON_TR)
+  .filter(([a, b]) => a !== b)
+  .sort((x, y) => y[0].length - x[0].length) // uzun ad önce ("Ultra All Inclusive" > "All Inclusive")
+  .map(([ad, okunus]) => [new RegExp(`(?<![\\p{L}])${ad.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\p{L}])`, 'giu'), okunus])
+function piperOkunus(text, lang) {
+  if ((lang || 'tr').slice(0, 2) !== 'tr') return text
+  let t = text
+  for (const [re, okunus] of PIPER_LEKSIKON_SIRALI) t = t.replace(re, okunus)
+  return t
+}
+
+/**
+ * KALICI Piper süreci: model her cümlede yeniden yüklenmez (ilk sürüm cümle başına süreç açıyordu,
+ * ~0,8 sn model yükleme). --json-input ile her satırdaki {"text","output_file"} için bir wav yazılır
+ * ve dosya yolu stdout'a basılır. Cümleler SIRAYLA işlenir (tek süreç); süreç ölürse bir sonraki
+ * istekte yeniden başlatılır.
+ */
+const piperSurecler = new Map()
+let piperSayac = 0
+let piperZincir = Promise.resolve()
+function piperSurecAl(m) {
+  const var_ = piperSurecler.get(m.yol)
+  if (var_ && !var_.olu) return var_
+  const args = ['--model', m.yol, '--json-input', '--length_scale', PIPER_LENGTH_SCALE, '--sentence_silence', '0.1']
+  if (PIPER_NOISE_SCALE) args.push('--noise_scale', PIPER_NOISE_SCALE)
+  if (PIPER_NOISE_W) args.push('--noise_w', PIPER_NOISE_W)
+  const p = spawn(PIPER_BIN, args, { stdio: ['pipe', 'pipe', 'pipe'] })
+  const s = { p, olu: false, satir: '', is: null }
+  const bitir = (hata) => {
+    s.olu = true
+    if (s.is) { const is = s.is; s.is = null; is.reject(hata) }
+  }
+  p.stdout.on('data', (d) => {
+    s.satir += d
+    let i
+    while ((i = s.satir.indexOf('\n')) >= 0) {
+      const yol = s.satir.slice(0, i).trim()
+      s.satir = s.satir.slice(i + 1)
+      if (yol && s.is) { const is = s.is; s.is = null; is.resolve(yol) }
+    }
+  })
+  p.stderr.on('data', () => {}) // boru dolmasın
+  p.stdin.on('error', () => {})
+  p.on('error', (e) => bitir(e))
+  p.on('close', (kod) => bitir(new Error(`piper süreci kapandı (çıkış ${kod})`)))
+  piperSurecler.set(m.yol, s)
+  return s
+}
+function piperUret(s, text) {
+  const dosya = path.join(os.tmpdir(), `piper-${process.pid}-${++piperSayac}.wav`)
+  return new Promise((resolve, reject) => {
+    const zaman = setTimeout(() => { s.olu = true; s.p.kill('SIGKILL'); reject(new Error('piper 15 sn zaman aşımı')) }, 15000)
+    s.is = {
+      resolve: (yol) => { clearTimeout(zaman); resolve(yol || dosya) },
+      reject: (e) => { clearTimeout(zaman); reject(e) },
+    }
+    s.p.stdin.write(JSON.stringify({ text, output_file: dosya }) + '\n')
+  }).then(async (yol) => {
+    try {
+      let wav = await fs.promises.readFile(yol)
+      if (wav.length <= 44) { await new Promise((r) => setTimeout(r, 60)); wav = await fs.promises.readFile(yol) }
+      return wav
+    } finally { fs.promises.unlink(yol).catch(() => {}) }
+  })
+}
+async function piperTts(text, { lang }) {
+  const m = piperModel(lang)
+  if (!m) throw new Error(`no Piper voice for ${lang}`)
+  const metin = piperOkunus(text, lang)
+  const is = piperZincir.then(() => piperUret(piperSurecAl(m), metin))
+  piperZincir = is.catch(() => {}) // bir hata sıradakini engellemesin
+  const wav = await is
+  const ham = wav.subarray(44) // piper standart 44 baytlık WAV başlığı
+  if (!ham.length) throw new Error('piper boş ses')
+  const cift = ham.length % 2 ? ham.subarray(0, ham.length - 1) : ham
+  return pcm16ToUlaw(m.hiz === 8000 ? cift : resamplePcm16(cift, m.hiz, 8000))
+}
+// Isınma: modeli çağrıdan ÖNCE yükle ki ilk cümle gecikmesin.
+if (fs.existsSync(PIPER_BIN)) setImmediate(() => { try { const m = piperModel('tr'); if (m) piperSurecAl(m) } catch { /* ısınma başarısızsa ilk istekte yeniden denenir */ } })
+
 const TTS_IMPL = {
   elevenlabs: { enabled: () => !!ELEVENLABS_API_KEY, run: elevenLabsTts },
   cartesia: { enabled: () => !!CARTESIA_API_KEY, run: cartesiaTts },
   groq: { enabled: () => !!GROQ_API_KEY, run: groqTts },
+  piper: { enabled: () => fs.existsSync(PIPER_BIN), run: piperTts },
   google: { enabled: () => !!GOOGLE_TTS_KEY, run: googleTts },
 }
 
@@ -384,7 +512,7 @@ async function synthesize(text, profile) {
       lastErr = e
       // Missing voice-id mappings are the normal "not configured for this
       // language" path — log them quietly so they don't look like outages.
-      if (!/no (ElevenLabs|Cartesia|Groq) voice/.test(e.message)) LOG(`tts ${name} failed: ${e.message} — next provider`)
+      if (!/no (ElevenLabs|Cartesia|Groq|Piper) voice/.test(e.message)) LOG(`tts ${name} failed: ${e.message} — next provider`)
     }
   }
   throw new Error(`all TTS providers failed${lastErr ? `: ${lastErr.message}` : ''}`)

@@ -368,7 +368,7 @@ class AiCall {
     this.profiles = applyVoiceOverride(
       (Array.isArray(voiceProfiles) && voiceProfiles.length) ? voiceProfiles : BUILTIN_PROFILES,
     )
-    const defId = defaultVoiceProfileId || 'female-tr'
+    const defId = defaultVoiceProfileId || process.env.AI_DEFAULT_VOICE_PROFILE || 'male-tr'
     this.currentProfile = this.profiles.find(p => p.id === defId) || this.profiles[0]
     // Lock the operator-selected gender — language auto-switch keeps this gender
     // so a female agent never flips to a male voice mid-call (and vice-versa).
