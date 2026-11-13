@@ -11,7 +11,7 @@
 // is byte-for-byte what it was before.
 //
 //   AI_STT_ORDER   default "deepgram,groq,whisper"
-//   AI_TTS_ORDER   default "piper,elevenlabs,cartesia,groq,google"
+//   AI_TTS_ORDER   default "azure,piper,elevenlabs,cartesia,groq,google"
 //
 // LLM model choice (Groq): llama-3.3-70b-versatile (default, current prod),
 // llama-3.1-8b-instant (router / cheap turns), qwen-2.5-72b-instruct and
@@ -19,8 +19,8 @@
 // grammar + tool-call stability. Set AI_LLM_MODEL_GROQ to switch, and
 // AI_LLM_MODEL_FALLBACK for the second attempt on a 429/5xx.
 
-const { ulawToWav, wavToUlaw, pcm16ToUlaw, resamplePcm16 } = require('./audio')
-const { piperToPhone } = require('./tone')
+const { ulawToWav, wavToUlaw, pcm16ToUlaw, resamplePcm16, ulawByteToPcm } = require('./audio')
+const { piperToPhone, rmsNormalize, int16ToFloat, floatToInt16 } = require('./tone')
 const { spawn } = require('child_process')
 const fs = require('fs')
 const os = require('os')
@@ -53,7 +53,7 @@ const CARTESIA_MODEL = process.env.CARTESIA_MODEL || 'sonic-2'
 
 const parseOrder = (v, def) => (v || def).split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
 const STT_ORDER = parseOrder(process.env.AI_STT_ORDER, 'deepgram,groq,whisper')
-const TTS_ORDER = parseOrder(process.env.AI_TTS_ORDER, 'piper,elevenlabs,cartesia,groq,google')
+const TTS_ORDER = parseOrder(process.env.AI_TTS_ORDER, 'azure,piper,elevenlabs,cartesia,groq,google')
 
 /** Parse a JSON env map; `{}` on anything unparseable so a typo can't crash a call. */
 function jsonEnv(name) {
@@ -517,7 +517,64 @@ function hazirCumle(text, profile) {
   return b ? Buffer.from(b) : null // kopya: çağıran tampon üzerinde değişiklik yapsa da kaynak bozulmasın
 }
 
+/**
+ * Azure Speech (Microsoft, RESMİ ürün) — Edge'in "Ahmet" sesiyle AYNI nöral ses ailesi.
+ * Karma moddaki önceden üretilmiş Edge cümleleriyle tonu bire bir tutmak için: değişken yanıtlar da
+ * aynı sesten gelir. Doğrudan 8 kHz µ-law döner (kapsülde ffmpeg gerekmez); gecikme ~0,2–0,5 sn.
+ * Metin Microsoft'a gider (sahibin onayı: 2026-11-13). Bölge seçilebilir (örn. westeurope).
+ * Etkinleştirme: AZURE_SPEECH_KEY + AZURE_SPEECH_REGION. Anahtar yoksa sağlayıcı kapalıdır.
+ * Hata/zaman aşımı → zincirde sıradaki sağlayıcı (Piper).
+ */
+const AZURE_KEY = process.env.AZURE_SPEECH_KEY || ''
+const AZURE_REGION = (process.env.AZURE_SPEECH_REGION || '').trim()
+const AZURE_TIMEOUT_MS = parseInt(process.env.AZURE_TTS_TIMEOUT_MS || '5000', 10)
+const AZURE_RATE = process.env.AZURE_TTS_RATE || '0%' // SSML prosody rate, ör. "+5%"
+// dil (whisperCode) → [erkek, kadın]. Edge'deki aynı adlar; AZURE_VOICES (JSON) ile ezilir.
+const AZURE_VOICES = {
+  tr: ['tr-TR-AhmetNeural', 'tr-TR-EmelNeural'],
+  en: ['en-US-GuyNeural', 'en-US-JennyNeural'],
+  de: ['de-DE-ConradNeural', 'de-DE-KatjaNeural'],
+  ru: ['ru-RU-DmitryNeural', 'ru-RU-SvetlanaNeural'],
+  ar: ['ar-SA-HamedNeural', 'ar-SA-ZariyahNeural'],
+  sv: ['sv-SE-MattiasNeural', 'sv-SE-SofieNeural'],
+  fr: ['fr-FR-HenriNeural', 'fr-FR-DeniseNeural'],
+  el: ['el-GR-NestorasNeural', 'el-GR-AthinaNeural'],
+}
+try { Object.assign(AZURE_VOICES, JSON.parse(process.env.AZURE_VOICES || '{}')) } catch { /* bozuk JSON → varsayılanlar */ }
+const xmlKac = (s) => s.replace(/[<>&"']/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' }[c]))
+function azureSes(lang, gender) {
+  const v = AZURE_VOICES[(lang || 'tr-TR').slice(0, 2)]
+  if (!v) return null
+  return gender === 'female' ? v[1] : v[0]
+}
+async function azureTts(text, { lang, gender }) {
+  const ses = azureSes(lang, gender)
+  if (!ses) throw new Error(`no Azure voice for ${lang}`)
+  const metin = piperOkunus(text, lang) // "Belconti" → "Belkonti" vb.: Edge'de doğrulanan aynı okunuş
+  const ssml = `<speak version='1.0' xml:lang='${xmlKac(lang || 'tr-TR')}'><voice name='${ses}'>` +
+    `<prosody rate='${xmlKac(AZURE_RATE)}'>${xmlKac(metin)}</prosody></voice></speak>`
+  const r = await fetch(`https://${AZURE_REGION}.tts.speech.microsoft.com/cognitiveservices/v1`, {
+    method: 'POST',
+    headers: {
+      'Ocp-Apim-Subscription-Key': AZURE_KEY,
+      'Content-Type': 'application/ssml+xml',
+      'X-Microsoft-OutputFormat': 'raw-8khz-8bit-mono-mulaw',
+      'User-Agent': 'ppg-sip-gateway',
+    },
+    body: ssml,
+    signal: AbortSignal.timeout(AZURE_TIMEOUT_MS),
+  })
+  if (!r.ok) throw new Error(`azure tts ${r.status}`)
+  const ulaw = Buffer.from(await r.arrayBuffer())
+  if (ulaw.length < 800) throw new Error('azure boş ses')
+  // Önceden üretilmiş Edge cümleleri ve Piper ile AYNI konuşma seviyesi (iki ses arasında sıçrama olmasın).
+  const pcm = Buffer.allocUnsafe(ulaw.length * 2)
+  for (let i = 0; i < ulaw.length; i++) pcm.writeInt16LE(ulawByteToPcm(ulaw[i]), i * 2)
+  return pcm16ToUlaw(floatToInt16(rmsNormalize(int16ToFloat(pcm), 8000)))
+}
+
 const TTS_IMPL = {
+  azure: { enabled: () => !!(AZURE_KEY && AZURE_REGION), run: azureTts },
   elevenlabs: { enabled: () => !!ELEVENLABS_API_KEY, run: elevenLabsTts },
   cartesia: { enabled: () => !!CARTESIA_API_KEY, run: cartesiaTts },
   groq: { enabled: () => !!GROQ_API_KEY, run: groqTts },
@@ -533,7 +590,7 @@ const TTS_IMPL = {
 async function synthesize(text, profile) {
   const hazir = hazirCumle(text, profile)
   if (hazir) return hazir
-  const ctx = { profileId: profile.id, lang: profile.lang, voiceName: profile.voice }
+  const ctx = { profileId: profile.id, lang: profile.lang, voiceName: profile.voice, gender: profile.gender }
   let lastErr = null
   for (const name of TTS_ORDER) {
     const impl = TTS_IMPL[name]
@@ -545,7 +602,7 @@ async function synthesize(text, profile) {
       lastErr = e
       // Missing voice-id mappings are the normal "not configured for this
       // language" path — log them quietly so they don't look like outages.
-      if (!/no (ElevenLabs|Cartesia|Groq|Piper) voice/.test(e.message)) LOG(`tts ${name} failed: ${e.message} — next provider`)
+      if (!/no (ElevenLabs|Cartesia|Groq|Piper|Azure) voice/.test(e.message)) LOG(`tts ${name} failed: ${e.message} — next provider`)
     }
   }
   throw new Error(`all TTS providers failed${lastErr ? `: ${lastErr.message}` : ''}`)
