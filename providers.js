@@ -400,7 +400,7 @@ const PIPER_LEKSIKON_TR = {
   'Blue Dreams': 'Blu Drimz',
   'Resort': 'Rizort',
   'Cristal': 'Kristal',
-  'Beach Club': 'Biç Klab',
+  'Beach Club': 'Biiç Klap',
   'All Inclusive': 'Ol İnklusiv',
   'Ultra All Inclusive': 'Ultra Ol İnklusiv',
   'Wi-Fi': 'Vay Fay',
