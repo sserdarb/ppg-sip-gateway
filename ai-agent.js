@@ -1262,4 +1262,6 @@ module.exports = {
   // Exported so test_conversation.js can assemble the REAL production prompt
   // (price + hotel blocks included) instead of an approximation of it.
   buildPriceBlock, buildHotelBlock, TOOL_SCHEMAS, makeSentenceCap,
+  // scripts/render-edge-phrases.js sabit cümleleri buradan okur (kopya liste tutulmasın)
+  FILLERS, LOOKUP_FILLERS,
 }

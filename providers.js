@@ -20,6 +20,7 @@
 // AI_LLM_MODEL_FALLBACK for the second attempt on a 429/5xx.
 
 const { ulawToWav, wavToUlaw, pcm16ToUlaw, resamplePcm16 } = require('./audio')
+const { piperToPhone } = require('./tone')
 const { spawn } = require('child_process')
 const fs = require('fs')
 const os = require('os')
@@ -383,7 +384,11 @@ function piperModel(lang) {
 }
 
 // Konuşma hızı: Piper'da length_scale KÜÇÜK = DAHA HIZLI (1.0 modelin doğal hızı).
-const PIPER_LENGTH_SCALE = process.env.PIPER_LENGTH_SCALE || '0.9'
+const PIPER_LENGTH_BASE = parseFloat(process.env.PIPER_LENGTH_SCALE || '0.9')
+// Perde çarpanı (Edge Ahmet'e yaklaştırma, bkz. tone.js). 1.0 = kapalı. Piper length_scale*k ile üretilir
+// ve çıktı örnekleme hızı*k sayılarak indirilir: perde k kat, hız eski haline döner.
+const PIPER_PITCH_K = Math.max(1, parseFloat(process.env.PIPER_PITCH_K || '1.20'))
+const PIPER_LENGTH_SCALE = String((PIPER_LENGTH_BASE * PIPER_PITCH_K).toFixed(4))
 // İsteğe bağlı doğallık ayarları (boş = modelin kendi değeri): noise_scale ↑ daha canlı/değişken,
 // noise_w ↑ daha serbest ritim. Aşırı değerlerde ses bozulur; 0.5–0.9 arası güvenli.
 const PIPER_NOISE_SCALE = process.env.PIPER_NOISE_SCALE || ''
@@ -481,10 +486,36 @@ async function piperTts(text, { lang }) {
   const ham = wav.subarray(44) // piper standart 44 baytlık WAV başlığı
   if (!ham.length) throw new Error('piper boş ses')
   const cift = ham.length % 2 ? ham.subarray(0, ham.length - 1) : ham
-  return pcm16ToUlaw(m.hiz === 8000 ? cift : resamplePcm16(cift, m.hiz, 8000))
+  return pcm16ToUlaw(piperToPhone(Buffer.from(cift), m.hiz, PIPER_PITCH_K, resamplePcm16))
 }
 // Isınma: modeli çağrıdan ÖNCE yükle ki ilk cümle gecikmesin.
 if (fs.existsSync(PIPER_BIN)) setImmediate(() => { try { const m = piperModel('tr'); if (m) piperSurecAl(m) } catch { /* ısınma başarısızsa ilk istekte yeniden denenir */ } })
+
+/**
+ * Önceden üretilmiş Edge (Ahmet) cümleleri — KARMA mod. Karşılama ve "Tabii efendim." gibi sabit cümleler
+ * dağıtımdan önce Edge ile üretilip assets/edge/ altına konur (kişisel veri içermez); çağrı sırasında
+ * hiçbir metin dışarı gitmez. Değişken yanıtlar Piper'dadır (tone.js ile Edge tınısına yaklaştırılmış).
+ * Eşleşme: profil kimliği + birebir metin. Kapatmak: EDGE_PHRASES=off.
+ */
+const EDGE_DIR = path.join(__dirname, 'assets', 'edge')
+const hazirCumleler = new Map() // `${profilId}\n${metin}` → Buffer (µ-law)
+const hazirAnahtar = (profilId, metin) => `${profilId}\n${String(metin).trim().replace(/\s+/g, ' ')}`
+if (process.env.EDGE_PHRASES !== 'off') {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(EDGE_DIR, 'manifest.json'), 'utf8'))
+    for (const [profilId, cumleler] of Object.entries(manifest)) {
+      for (const [metin, dosya] of Object.entries(cumleler)) {
+        const f = path.join(EDGE_DIR, dosya)
+        if (fs.existsSync(f)) hazirCumleler.set(hazirAnahtar(profilId, metin), fs.readFileSync(f))
+      }
+    }
+    if (hazirCumleler.size) console.log(`[ai] hazır Edge cümleleri yüklendi: ${hazirCumleler.size}`)
+  } catch { /* manifest yok → tüm cümleler normal TTS zincirinden */ }
+}
+function hazirCumle(text, profile) {
+  const b = hazirCumleler.get(hazirAnahtar(profile.id, text))
+  return b ? Buffer.from(b) : null // kopya: çağıran tampon üzerinde değişiklik yapsa da kaynak bozulmasın
+}
 
 const TTS_IMPL = {
   elevenlabs: { enabled: () => !!ELEVENLABS_API_KEY, run: elevenLabsTts },
@@ -500,6 +531,8 @@ const TTS_IMPL = {
  * @param {object} profile  { id, lang, voice }  (a voice-profile entry)
  */
 async function synthesize(text, profile) {
+  const hazir = hazirCumle(text, profile)
+  if (hazir) return hazir
   const ctx = { profileId: profile.id, lang: profile.lang, voiceName: profile.voice }
   let lastErr = null
   for (const name of TTS_ORDER) {
@@ -837,7 +870,7 @@ function providerStatus() {
 }
 
 module.exports = {
-  transcribe, synthesize, chatStream, chatJson, emitSentences,
+  transcribe, synthesize, chatStream, chatJson, emitSentences, piperOkunus,
   buildVocabulary, providerStatus, isHallucinatedTranscript,
   GROQ_LLM_FALLBACK, GROQ_LLM_MODEL,
 }
