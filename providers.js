@@ -506,7 +506,11 @@ function piperUret(s, text) {
     } finally { fs.promises.unlink(yol).catch(() => {}) }
   })
 }
-async function piperTts(text, { lang }) {
+// AI_PERSONA_RANDOM açıkken kadın persona (Elif) Piper'ın ERKEK sesiyle ASLA konuşmaz: Google kullanılamıyorsa bu sağlayıcı reddeder,
+// çağıran (ai-agent) çağrıyı aynı dilde erkek persona (Emre) ile sürdürür.
+const PIPER_FEMALE_BLOCK = /^(on|1|true|yes)$/i.test(process.env.AI_PERSONA_RANDOM || '')
+async function piperTts(text, { lang, gender }) {
+  if (gender === 'female' && PIPER_FEMALE_BLOCK) throw new Error('no Piper voice for female (kadın persona erkek sesle konuşmaz)')
   const m = piperModel(lang)
   if (!m) throw new Error(`no Piper voice for ${lang}`)
   const metin = piperOkunus(text, lang)
@@ -778,6 +782,10 @@ async function emitSentences(pending, onSentence, shouldStop) {
     if (shouldStop && shouldStop()) return out
     const m = out.match(SENTENCE_END)
     if (!m) break
+    // Akış tamponu tam "…117." ile bitiyorsa nokta binlik ayracı olabilir (sıradaki jeton "760"): cümleyi BÖLME, bekle.
+    // Bölününce "117." tek başına konuşulup sıra sayısı okunuyordu ("yüz on yedi-inci, yedi yüz altmış lira").
+    // Gerçek cümle sonu ("… 5.") bir sonraki parça gelince ya da akış bitince (çağıran kalanı konuşur) zaten çıkar.
+    if (/\d\.+$/.test(m[1]) && m[2].trim() === '') break
     const sentence = m[1].trim()
     out = m[2]
     if (sentence) await onSentence(sentence)

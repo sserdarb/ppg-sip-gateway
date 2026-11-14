@@ -87,7 +87,7 @@ const LOCALES = {
         uai: 'ultra her şey dahil', ai: 'her şey dahil', hb: 'yarım pansiyon',
         fb: 'tam pansiyon', bb: 'oda kahvaltı', ro: 'sadece oda',
       }),
-      [/\bSPA\b/g, 'spa'],
+      [/\bspa\b/gi, 'sıpa'], // Türkçede "spa" → "sıpa" ("SPA" harf harf, "spa" İngilizce okunuyordu); "Spa'ya" → "sıpa'ya"
       [/\bWi[-\s]?Fi\b/gi, 'vay fay'], [/\bWIFI\b/g, 'vay fay'],
       [/\bT\.?V\b/g, 'televizyon'], [/\bW\.?C\b/g, 'tuvalet'], [/\bA\/?C\b/g, 'klima'],
       [/\bF\s*&\s*B\b/gi, 'yiyecek içecek'], [/\bVIP\b/g, 'vip'],

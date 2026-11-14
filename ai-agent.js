@@ -488,6 +488,8 @@ class AiCall {
       if (this.closed) return
       for (let i = 0; i < 15; i++) this.playQueue.push(SILENCE_FRAME)
       this.speaking = true
+      this._voiceFor(this._greeting)   // Google yoksa Emre'ye geç; karşılamadaki ad da değişir
+      this._greetingSaid = true
       this.say(this._greeting)
     }, 900)
     // Warm one filler for the starting voice so the first turn is instant.
@@ -708,6 +710,42 @@ class AiCall {
    * to any profile for that language. This stops a female agent flipping to a
    * male voice when the caller speaks another language.
    */
+  /**
+   * Konuşmadan önce ses denetimi. Rastgele persona modunda kadın persona (Elif) yalnız Google sesi gerçekten kullanılabilirken konuşur;
+   * günlük karakter payı biterse ya da Google kullanılamazsa çağrı Emre'ye devredilir (Piper'ın kadın sesi yok, Elif erkek sesle
+   * konuşmaz). Geçiş tek yönlüdür: bir çağrıda Emre'ye geçen persona geri dönmez.
+   */
+  _voiceFor(text) {
+    const p = this.currentProfile
+    if (PERSONA_RANDOM && p && p.gender === 'female' && !googleTtsReady(String(text || '').length + 200)) {
+      this._switchGender('male', 'Google ses payı/erişimi yok')
+    }
+    return this.currentProfile
+  }
+
+  /** Aynı dilde istenen cinsiyetteki personaya geç: ses + ad + sistem istemi birlikte (switchProfileByLang ile aynı ilke). */
+  _switchGender(gender, reason) {
+    const cur = this.currentProfile
+    if (!cur || cur.gender === gender) return false
+    const target = this.profiles.find(p => p.whisperCode === cur.whisperCode && p.gender === gender)
+    if (!target) return false
+    LOG(`persona switch (${reason}): ${cur.id} → ${target.id}`)
+    const oldName = this.agentName
+    this.currentProfile = target
+    this.lockedGender = gender
+    if (!this._agentNamePinned) {
+      const newName = profileAgentName(target)
+      if (newName !== oldName) {
+        this.agentName = newName
+        if (!this._greetingSaid && this._greeting) this._greeting = this._greeting.split(oldName).join(newName)
+        this.systemPrompt = this.buildSystemPrompt()
+        if (this.history && this.history[0] && this.history[0].role === 'system') this.history[0].content = this.systemPrompt
+      }
+    }
+    if (this.prewarmFiller) this.prewarmFiller().catch(() => {})
+    return true
+  }
+
   switchProfileByLang(detectedLang) {
     if (!detectedLang) return
     const sameGender = this.profiles.find(p => p.whisperCode === detectedLang && p.gender === this.lockedGender)
@@ -1162,10 +1200,17 @@ class AiCall {
     // hear "Halbpension" and "bis", not the Turkish forms.
     const text = sanitizeForSpeech(rawText, this.currentProfile.whisperCode)
     if (!text) return
-    const profile = this.currentProfile
+    const profile = this._voiceFor(text)
     this._pendingTts++
     // Start the network fetch RIGHT NOW — before the previous sentence finishes.
-    const fetchP = synthesize(text, profile).catch(e => { LOG('tts err', e.message); return null })
+    const fetchP = synthesize(text, profile).catch(async (e) => {
+      // Kadın persona sesi üretilemedi (Google hata verdi): sessiz kalmak yerine Emre devralır, cümle onunla yeniden denenir.
+      if (PERSONA_RANDOM && profile.gender === 'female' && this._switchGender('male', 'tts hatası: ' + String(e.message).slice(0, 70))) {
+        try { return await synthesize(text, this.currentProfile) } catch (e2) { e = e2 }
+      }
+      LOG('tts err', e.message)
+      return null
+    })
     // Queue audio only after previous say() has finished queuing (order preserved).
     this._sayChain = this._sayChain.then(async () => {
       const ulaw = await fetchP

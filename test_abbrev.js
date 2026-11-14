@@ -30,7 +30,10 @@ check(!/(^|\s)her şey dahil/.test(expandAbbreviations('UAI').replace('ultra her
   'UAI kuralı AI kuralına yem olmuyor', expandAbbreviations('UAI'))
 
 console.log('\n— tesis ve jargon —')
-says('SPA merkezimiz', 'spa', ['SPA'])
+says('SPA merkezimiz', 'sıpa', ['SPA'])
+says('Spa ve wellness alanı', 'sıpa', ['Spa '])
+says("Spa'ya randevu alabilirsiniz", 'sıpaya', ['Spa'])
+says('spa merkezi açık', 'sıpa', ['spa '])
 says('Wi-Fi şifresi', 'vay fay', ['Wi-Fi', 'Wi Fi'])
 says('WIFI var mı', 'vay fay', ['WIFI'])
 says('odada TV var', 'televizyon', ['TV'])
