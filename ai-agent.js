@@ -14,7 +14,7 @@ const dgram = require('dgram')
 const os = require('os')
 
 const { ulawByteToPcm } = require('./audio')
-const { transcribe, synthesize, chatStream, buildVocabulary, providerStatus } = require('./providers')
+const { transcribe, synthesize, chatStream, buildVocabulary, providerStatus, googleTtsReady } = require('./providers')
 const { sanitizeForSpeech } = require('./speech')
 const { classifyIntent, intentDirective } = require('./intent-router')
 
@@ -42,6 +42,9 @@ const LOG = (...a) => console.log('[ai]', ...a)
 // Overridable per profile id so a voice can be swapped after listening to
 // samples, without waiting on a PPG deploy:
 //   AI_VOICE_OVERRIDE={"female-tr":"tr-TR-Chirp3-HD-Kore","male-tr":"tr-TR-Chirp3-HD-Puck"}
+// Rastgele persona: AI_PERSONA_RANDOM=on iken çağrı başına Emre (erkek) ya da Elif (kadın). Bkz. resolvePersona().
+const PERSONA_RANDOM = /^(on|1|true|yes)$/i.test(process.env.AI_PERSONA_RANDOM || '')
+const PERSONA_FEMALE_RATIO = Math.min(1, Math.max(0, parseFloat(process.env.AI_PERSONA_FEMALE_RATIO || '0.5')))
 const DEFAULT_VOICE_OVERRIDE = {
   'female-tr': process.env.AI_VOICE_TR_FEMALE || 'tr-TR-Chirp3-HD-Achernar',
   'male-tr': process.env.AI_VOICE_TR_MALE || 'tr-TR-Chirp3-HD-Puck',
@@ -100,6 +103,38 @@ const BUILTIN_PROFILES = [
 
 /** The bare name to speak for a profile — never the admin dropdown label. */
 const profileAgentName = (p) => (p && (p.agentName || p.name)) || 'Asistan'
+
+/**
+ * Çağrı başına persona (ses profili + ad + karşılama). Varsayılan davranış (random=false) eskisiyle AYNIDIR:
+ * operatörün (PPG) seçtiği ad ve profil kazanır.
+ *
+ * random=true (AI_PERSONA_RANDOM=on): PPG'nin sabitlediği ad/varsayılan profil/varsayılan ad YOK SAYILIR; çağrı başında
+ * erkek (male-tr, Emre) ya da kadın (female-tr, Elif) rastgele seçilir ve ad profile uyar. PPG karşılama metni korunur, yalnız
+ * içindeki sabit ad seçilen adla değiştirilir ("ben Ayşe" → "ben Emre"). Kadın persona yalnız femaleReady iken seçilir
+ * (Piper yedeğinin kadın sesi yok; Google sesi yoksa kadın çağrı erkek sesle konuşurdu). Dil değişince cinsiyet kilitli kalır.
+ */
+function resolvePersona({ profiles, defaultVoiceProfileId, agentName, defaultAgentName, greetingOverride, hotel,
+  random = false, rng = Math.random, femaleReady = true, femaleRatio = 0.5 }) {
+  let id = defaultVoiceProfileId || process.env.AI_DEFAULT_VOICE_PROFILE || 'male-tr'
+  let randomized = false
+  if (random && profiles.some(p => p.id === 'male-tr') && profiles.some(p => p.id === 'female-tr')) {
+    id = (femaleReady && rng() < femaleRatio) ? 'female-tr' : 'male-tr'
+    randomized = true
+  }
+  const profile = profiles.find(p => p.id === id) || profiles[0]
+  const operatorName = (!randomized && agentName && String(agentName).trim()) ? String(agentName).trim() : ''
+  const name = operatorName || ((randomized ? undefined : defaultAgentName) || profileAgentName(profile))
+  let greeting = greetingOverride
+  if (randomized && greeting && agentName && String(agentName).trim()) greeting = greeting.split(String(agentName).trim()).join(name)
+  return {
+    profile,
+    pinned: !!operatorName,
+    randomized,
+    agentName: name,
+    greeting: greeting || `${hotel} çağrı merkezine hoş geldiniz, ben ${name}. Size nasıl yardımcı olabilirim?`,
+  }
+}
+
 
 /**
  * Hard cap on how many sentences reach the caller in one turn.
@@ -368,8 +403,13 @@ class AiCall {
     this.profiles = applyVoiceOverride(
       (Array.isArray(voiceProfiles) && voiceProfiles.length) ? voiceProfiles : BUILTIN_PROFILES,
     )
-    const defId = defaultVoiceProfileId || process.env.AI_DEFAULT_VOICE_PROFILE || 'male-tr'
-    this.currentProfile = this.profiles.find(p => p.id === defId) || this.profiles[0]
+    const hotelForGreeting = HOTEL === 'otelimiz' ? 'otelimiz' : HOTEL
+    const persona = resolvePersona({
+      profiles: this.profiles, defaultVoiceProfileId, agentName, defaultAgentName, greetingOverride,
+      hotel: hotelForGreeting,
+      random: PERSONA_RANDOM, femaleReady: googleTtsReady(), femaleRatio: PERSONA_FEMALE_RATIO,
+    })
+    this.currentProfile = persona.profile
     // Lock the operator-selected gender — language auto-switch keeps this gender
     // so a female agent never flips to a male voice mid-call (and vice-versa).
     this.lockedGender = this.currentProfile.gender || (this.currentProfile.id.startsWith('male') ? 'male' : 'female')
@@ -384,16 +424,13 @@ class AiCall {
     // PPG sends `agentName` ONLY when the hotel configured one, and passes the
     // per-language default separately as `defaultAgentName` — collapsing the
     // two would make every call look pinned and freeze the name in one language.
-    this._agentNamePinned = !!(agentName && String(agentName).trim())
-    this.agentName = this._agentNamePinned
-      ? String(agentName).trim()
-      : (defaultAgentName || profileAgentName(this.currentProfile))
+    this._agentNamePinned = persona.pinned
+    this.agentName = persona.agentName
     const hotel = HOTEL === 'otelimiz' ? 'otelimiz' : HOTEL
     this.hotelName = (hotelInfo && hotelInfo.name) || hotel
 
     // Greeting
-    this._greeting = greetingOverride ||
-      `${hotel} çağrı merkezine hoş geldiniz, ben ${this.agentName}. Size nasıl yardımcı olabilirim?`
+    this._greeting = persona.greeting
 
     // Live data blocks injected from PPG.
     this._priceBlock = buildPriceBlock(priceContext)
@@ -1263,5 +1300,5 @@ module.exports = {
   // (price + hotel blocks included) instead of an approximation of it.
   buildPriceBlock, buildHotelBlock, TOOL_SCHEMAS, makeSentenceCap,
   // scripts/render-edge-phrases.js sabit cümleleri buradan okur (kopya liste tutulmasın)
-  FILLERS, LOOKUP_FILLERS, applyVoiceOverride,
+  FILLERS, LOOKUP_FILLERS, applyVoiceOverride, resolvePersona,
 }

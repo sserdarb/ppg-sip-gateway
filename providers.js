@@ -352,6 +352,12 @@ const SPEAKING_RATE = parseFloat(process.env.AI_TTS_SPEAKING_RATE || '1.0')
 const GOOGLE_TTS_DAILY_CHARS = parseInt(process.env.GOOGLE_TTS_DAILY_CHARS || '30000', 10)
 let googleGun = new Date().toISOString().slice(0, 10)
 let googleKullanilan = 0
+/** Kadın persona (Piper'ın kadın sesi yok) yalnız Google sesi gerçekten kullanılabilirken seçilsin: anahtar var ve günlük sınırdan yeterli pay kaldı. */
+function googleTtsReady(minChars = 3000) {
+  if (!GOOGLE_TTS_KEY || !(GOOGLE_TTS_DAILY_CHARS > 0)) return false
+  if (new Date().toISOString().slice(0, 10) !== googleGun) return true
+  return GOOGLE_TTS_DAILY_CHARS - googleKullanilan > minChars
+}
 function googleKota(n) {
   if (!(GOOGLE_TTS_DAILY_CHARS > 0)) throw new Error('google tts kapali (GOOGLE_TTS_DAILY_CHARS=0)')
   const bugun = new Date().toISOString().slice(0, 10)
@@ -951,7 +957,7 @@ function providerStatus() {
 }
 
 module.exports = {
-  transcribe, synthesize, chatStream, chatJson, emitSentences, piperOkunus,
+  transcribe, synthesize, chatStream, chatJson, emitSentences, piperOkunus, googleTtsReady,
   buildVocabulary, providerStatus, isHallucinatedTranscript,
   GROQ_LLM_FALLBACK, GROQ_LLM_MODEL,
 }
