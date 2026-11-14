@@ -44,7 +44,7 @@ const LOG = (...a) => console.log('[ai]', ...a)
 //   AI_VOICE_OVERRIDE={"female-tr":"tr-TR-Chirp3-HD-Kore","male-tr":"tr-TR-Chirp3-HD-Puck"}
 const DEFAULT_VOICE_OVERRIDE = {
   'female-tr': process.env.AI_VOICE_TR_FEMALE || 'tr-TR-Chirp3-HD-Achernar',
-  'male-tr': process.env.AI_VOICE_TR_MALE || 'tr-TR-Chirp3-HD-Charon',
+  'male-tr': process.env.AI_VOICE_TR_MALE || 'tr-TR-Chirp3-HD-Puck',
 }
 let VOICE_OVERRIDE = DEFAULT_VOICE_OVERRIDE
 try {
@@ -1263,5 +1263,5 @@ module.exports = {
   // (price + hotel blocks included) instead of an approximation of it.
   buildPriceBlock, buildHotelBlock, TOOL_SCHEMAS, makeSentenceCap,
   // scripts/render-edge-phrases.js sabit cümleleri buradan okur (kopya liste tutulmasın)
-  FILLERS, LOOKUP_FILLERS,
+  FILLERS, LOOKUP_FILLERS, applyVoiceOverride,
 }

@@ -11,7 +11,7 @@
 // is byte-for-byte what it was before.
 //
 //   AI_STT_ORDER   default "deepgram,groq,whisper"
-//   AI_TTS_ORDER   default "azure,piper,elevenlabs,cartesia,groq,google"
+//   AI_TTS_ORDER   default "azure,google,piper,elevenlabs,cartesia,groq"
 //
 // LLM model choice (Groq): llama-3.3-70b-versatile (default, current prod),
 // llama-3.1-8b-instant (router / cheap turns), qwen-2.5-72b-instruct and
@@ -53,7 +53,7 @@ const CARTESIA_MODEL = process.env.CARTESIA_MODEL || 'sonic-2'
 
 const parseOrder = (v, def) => (v || def).split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
 const STT_ORDER = parseOrder(process.env.AI_STT_ORDER, 'deepgram,groq,whisper')
-const TTS_ORDER = parseOrder(process.env.AI_TTS_ORDER, 'azure,piper,elevenlabs,cartesia,groq,google')
+const TTS_ORDER = parseOrder(process.env.AI_TTS_ORDER, 'azure,google,piper,elevenlabs,cartesia,groq')
 
 /** Parse a JSON env map; `{}` on anything unparseable so a typo can't crash a call. */
 function jsonEnv(name) {
@@ -343,7 +343,27 @@ async function groqTts(text, { voiceName }) {
 const isChirp = (v) => /-Chirp\d?-?HD-/i.test(v || '')
 const SPEAKING_RATE = parseFloat(process.env.AI_TTS_SPEAKING_RATE || '1.0')
 
+/**
+ * Google Cloud TTS günlük KARAKTER sınırı. Chirp 3 HD'nin ayda ilk 1 milyon karakteri ücretsiz, sonrası $30/milyon;
+ * Developer kredisi bitmişse aşım doğrudan karttan çıkar. Varsayılan 30.000/gün (≈900 bin/ay) ücretsiz kotanın altında
+ * kalır; sınır dolunca bu sağlayıcı reddeder ve zincir yerel Piper'a düşer (çağrı kesilmez). Sayaç bellek içidir:
+ * yeniden başlatmada o günün sayacı sıfırlanır (en kötü ihtimalle birkaç bin karakter fazla). Kapatmak: GOOGLE_TTS_DAILY_CHARS=0.
+ */
+const GOOGLE_TTS_DAILY_CHARS = parseInt(process.env.GOOGLE_TTS_DAILY_CHARS || '30000', 10)
+let googleGun = new Date().toISOString().slice(0, 10)
+let googleKullanilan = 0
+function googleKota(n) {
+  if (!(GOOGLE_TTS_DAILY_CHARS > 0)) throw new Error('google tts kapali (GOOGLE_TTS_DAILY_CHARS=0)')
+  const bugun = new Date().toISOString().slice(0, 10)
+  if (bugun !== googleGun) { googleGun = bugun; googleKullanilan = 0 }
+  if (googleKullanilan + n > GOOGLE_TTS_DAILY_CHARS) throw new Error(`google tts gunluk karakter siniri (${GOOGLE_TTS_DAILY_CHARS}) doldu`)
+  googleKullanilan += n
+}
+
 async function googleTts(text, { lang, voiceName }) {
+  // Marka okunuşları (Belconti → Belkonti …): Piper/Azure ile aynı sözlük; Türkçe dışı metne dokunmaz.
+  const metin = piperOkunus(text, lang)
+  googleKota(metin.length)
   const audioConfig = { audioEncoding: 'MULAW', sampleRateHertz: 8000 }
   if (SPEAKING_RATE && SPEAKING_RATE !== 1.0) audioConfig.speakingRate = SPEAKING_RATE
   // pitch is only safe on the classic voices.
@@ -353,7 +373,7 @@ async function googleTts(text, { lang, voiceName }) {
   const r = await fetch(`https://texttospeech.googleapis.com/v1/text:synthesize?key=${GOOGLE_TTS_KEY}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      input: { text },
+      input: { text: metin },
       voice: { languageCode: lang, name: voiceName },
       audioConfig,
     }),
@@ -361,7 +381,11 @@ async function googleTts(text, { lang, voiceName }) {
   })
   const j = await r.json().catch(() => ({}))
   if (!j.audioContent) throw new Error('google tts: ' + JSON.stringify(j).slice(0, 120))
-  return Buffer.from(j.audioContent, 'base64')
+  // Önceden üretilmiş cümleler ve Piper/Azure ile AYNI konuşma seviyesi (sesler arasında sıçrama olmasın).
+  const ulaw = Buffer.from(j.audioContent, 'base64')
+  const pcm = Buffer.allocUnsafe(ulaw.length * 2)
+  for (let i = 0; i < ulaw.length; i++) pcm.writeInt16LE(ulawByteToPcm(ulaw[i]), i * 2)
+  return pcm16ToUlaw(floatToInt16(rmsNormalize(int16ToFloat(pcm), 8000)))
 }
 
 /**
