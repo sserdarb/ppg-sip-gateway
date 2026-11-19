@@ -47,6 +47,9 @@ const DEEPGRAM_MODEL = process.env.DEEPGRAM_STT_MODEL || 'nova-2'
 // emits tool calls, -20b likewise at ~570ms; qwen3.6-27b never called a tool.
 const GROQ_LLM_MODEL = process.env.AI_LLM_MODEL_GROQ || process.env.GROQ_LLM_MODEL || 'openai/gpt-oss-120b'
 const GROQ_LLM_FALLBACK = process.env.AI_LLM_MODEL_FALLBACK || 'openai/gpt-oss-20b'
+// Groq's TPM limit (8000) is PER MODEL; a third model gives another budget when
+// the first two are rate-limited mid-call (measured 19 Nov 2026: all three answer 200).
+const GROQ_LLM_FALLBACK2 = process.env.AI_LLM_MODEL_FALLBACK2 || 'qwen/qwen3.8-27b'
 const NVIDIA_LLM_MODEL = process.env.AI_LLM_MODEL || 'meta/llama-3.3-70b-instruct'
 const ELEVEN_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_turbo_v2_5'
 const CARTESIA_MODEL = process.env.CARTESIA_MODEL || 'sonic-2'
@@ -703,7 +706,12 @@ const OPENROUTER_MODEL = process.env.OPENROUTER_LLM_MODEL || 'meta-llama/llama-3
 // 50k tokens + 50 requests per minute, no daily cap) and Groq's current
 // catalogue. Mistral leads on TURKISH QUALITY — gpt-oss is the model that has
 // leaked English and CJK mid-sentence — with Groq right behind it at ~610ms.
-const LLM_ORDER = parseOrder(process.env.AI_LLM_CHAIN, 'mistral,groq,cerebras,openrouter,zhipu,nvidia')
+// 19 Nov 2026 live test call: cerebras and openrouter answered 402 (credits), the
+// NVIDIA llama-3.3 id is gone (410), mistral small 429s under the account's request
+// limit — every dead entry cost a wasted round trip per turn and the chain ran dry,
+// so the caller never heard a price. Default now lists only vendors measured to
+// answer (groq x3 models, mistral, zhipu); the dead ones stay opt-in via AI_LLM_CHAIN.
+const LLM_ORDER = parseOrder(process.env.AI_LLM_CHAIN, 'groq,mistral,zhipu')
 
 function llmChain() {
   const byVendor = {
@@ -721,6 +729,12 @@ function llmChain() {
         out.push({
           name: `groq:${GROQ_LLM_FALLBACK}`, url, key: GROQ_API_KEY,
           model: GROQ_LLM_FALLBACK, reasoningEffort: effort(GROQ_LLM_FALLBACK),
+        })
+      }
+      if (GROQ_LLM_FALLBACK2 && ![GROQ_LLM_MODEL, GROQ_LLM_FALLBACK].includes(GROQ_LLM_FALLBACK2)) {
+        out.push({
+          name: `groq:${GROQ_LLM_FALLBACK2}`, url, key: GROQ_API_KEY,
+          model: GROQ_LLM_FALLBACK2, reasoningEffort: effort(GROQ_LLM_FALLBACK2),
         })
       }
       return out
