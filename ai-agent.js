@@ -17,6 +17,7 @@ const { ulawByteToPcm } = require('./audio')
 const { transcribe, synthesize, chatStream, buildVocabulary, providerStatus, googleTtsReady } = require('./providers')
 const { sanitizeForSpeech } = require('./speech')
 const { classifyIntent, intentDirective } = require('./intent-router')
+const { buildAvailabilitySpeech } = require('./availability-speech')
 
 function detectIp() {
   const ifs = os.networkInterfaces()
@@ -590,6 +591,8 @@ class AiCall {
       `\n- ⛔ REZERVASYON YAPTIĞINI SÖYLEME. "Ayırttım / rezervasyonunuzu oluşturdum / yerinizi tuttum" DEME. Sen ödeme linkli TEKLİF gönderirsin: "Teklifinizi hazırlıyorum, ödeme linkiyle birlikte gönderiyorum; ödeme tamamlanınca rezervasyonunuz kesinleşir" de.` +
       `\n- ⛔ Müsaitlik sorgusu çalışmadan "yerimiz var/müsaitiz/ayırtabiliriz" DEME.` +
       `\n- Fiyat sorulunca önce tarih + kişi sayısı + çocuk yaşını tamamla, sonra sorguyu çalıştır.` +
+      `\n- ⛔ ÇIKIŞ TARİHİNİ / GECE SAYISINI ASLA TAHMİN ETME. Misafir söylemediyse "kaç gece kalacaksınız?" diye sor; 1 gece varsayma. Tarihleri aynen misafirin söylediği gibi kullan.` +
+      `\n- ⛔ Kendi sorduğun soruyu kendin cevaplama ("doğru mu? Evet" gibi); misafirin sesli yanıtını bekle.` +
       `\n- Kart numarası/CVV ASLA isteme; ödeme sadece güvenli link ile.` +
       `\n- Resepsiyon inisiyatifindeki konulara (erken giriş vb.) kesin söz verme; "not alıyorum, müsaitliğe göre" de.` +
       `\n- Rezervasyonu kesinleştirmeden önce tarih, kişi ve toplam tutarı özetleyip sesli onay al.` +
@@ -1114,6 +1117,14 @@ class AiCall {
 
   async handleToolCalls(rawReply) {
     const raw = this.parseActions(rawReply).find(a => a && a.type === 'check_availability')
+    // A stay length the caller never gave must not be invented: a weak model
+    // filled in a 1-night stay and quoted/confirmed it on its own. No (or
+    // non-positive) check-out → ask the number of nights instead of querying.
+    if (raw && (!/^\d{4}-\d{2}-\d{2}$/.test(raw.checkOut || '') || !/^\d{4}-\d{2}-\d{2}$/.test(raw.checkIn || '') || raw.checkOut <= raw.checkIn)) {
+      LOG('tool call without a usable check-out — asking nights instead:', JSON.stringify(raw))
+      this.say('Kaç gece konaklamayı düşünüyorsunuz, çıkış tarihiniz hangi gün?')
+      return true
+    }
     const call = raw ? this.normalizeStayDates(raw) : null
     if (!call || !this.onTool || this._toolInFlight) return false
     this._toolInFlight = true
@@ -1141,17 +1152,35 @@ class AiCall {
       role: 'system',
       content: result
         ? `MÜSAİTLİK SORGU SONUCU (sistemden geldi, GERÇEK veri — sadece bunu kullan):\n${JSON.stringify(result)}\n` +
-          `Bu sonucu misafire 1-2 cümleyle, sesli okunacak biçimde aktar. Fiyatı UYDURMA; sonuçta yoksa kesin fiyat verme.` +
+          `Bu sonucu misafire 1-2 cümleyle, sesli okunacak biçimde aktar: giriş-çıkış tarihlerini ve gece sayısını söyle, toplam fiyatı ve gecelik fiyatı mutlaka söyle. Fiyatı UYDURMA; sonuçta yoksa kesin fiyat verme.` +
           (stockUnknown
             ? ` DİKKAT: oda ADEDİ bilgisi yok. Fiyatı söyleyebilirsin ama "kesin yeriniz var / ayırdım" DEME; "fiyatımız şu, uygunsa hemen teyit ettirelim" gibi kur.`
             : ` Boş oda yoksa pozitif çerçeveleyip alternatif tarih öner.`)
         : `MÜSAİTLİK SORGUSU BAŞARISIZ: sisteme ulaşılamadı. Misafire fiyat/müsaitlik UYDURMA; kısa bir özür ile bir yetkiliye aktaracağını söyle ve transfer aksiyonunu çalıştır.`,
     })
 
-    const followUp = await this.runLlmTurn()
+    let followUp = ''
+    try { followUp = await this.runLlmTurn() } catch (e) { LOG('LLM(tool) error:', e.message) }
     LOG('LLM(tool):', JSON.stringify(followUp))
-    if (followUp) this.runActions(followUp)
-    else if (!result) this.dispatchAction({ type: 'transfer', department: 'reservation', reason: 'availability-lookup-failed' })
+    if (this.closed || this.cancelResponse) return true
+    if (followUp && followUp.replace(/\[\[ACTION[\s\S]*?\]\]/g, '').trim()) {
+      this.runActions(followUp)
+    } else if (result) {
+      // The lookup worked but the model produced no words (dead provider chain /
+      // empty completion). The data is structured — speak it deterministically
+      // so the caller still hears the price instead of a silent line.
+      const speech = buildAvailabilitySpeech(result)
+      LOG('LLM(tool) empty — speaking availability result directly:', JSON.stringify(speech))
+      if (speech) {
+        this.history.push({ role: 'assistant', content: speech })
+        await this.say(speech)
+        if (result.reason === 'stay-too-long') this.dispatchAction({ type: 'transfer', department: 'sales', reason: 'stay-too-long' })
+      } else {
+        this.dispatchAction({ type: 'transfer', department: 'reservation', reason: 'availability-no-data' })
+      }
+    } else {
+      this.dispatchAction({ type: 'transfer', department: 'reservation', reason: 'availability-lookup-failed' })
+    }
     return true
   }
 
