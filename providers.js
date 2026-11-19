@@ -50,7 +50,14 @@ const GROQ_LLM_FALLBACK = process.env.AI_LLM_MODEL_FALLBACK || 'openai/gpt-oss-2
 // Groq's TPM limit (8000) is PER MODEL; a third model gives another budget when
 // the first two are rate-limited mid-call (measured 19 Nov 2026: all three answer 200).
 const GROQ_LLM_FALLBACK2 = process.env.AI_LLM_MODEL_FALLBACK2 || 'qwen/qwen3.8-27b'
-const NVIDIA_LLM_MODEL = process.env.AI_LLM_MODEL || 'meta/llama-3.3-70b-instruct'
+// NVIDIA retired llama-3.3 (410). Measured 19 Nov 2026 from inside the gateway on the real
+// call prompt: the Nemotron 3 family answers in 0.6-1.2 s, calls the availability tool with
+// the right dates and speaks clean Turkish — BUT only with thinking switched OFF
+// (chat_template_kwargs.enable_thinking=false). With thinking on they spend the whole token
+// budget on reasoning and the caller hears silence (empty content, 0.5-1 KB of reasoning).
+// ultra = best date accuracy; nano-omni = fastest. Both gemma ids 404, glm/kimi/gemma-4 time out.
+const NVIDIA_LLM_MODEL = process.env.AI_LLM_MODEL || 'nvidia/nemotron-3-ultra-550b-a55b'
+const NVIDIA_LLM_FALLBACK = process.env.AI_LLM_MODEL_NVIDIA2 || 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning'
 const ELEVEN_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_turbo_v2_5'
 const CARTESIA_MODEL = process.env.CARTESIA_MODEL || 'sonic-2'
 
@@ -711,7 +718,7 @@ const OPENROUTER_MODEL = process.env.OPENROUTER_LLM_MODEL || 'meta-llama/llama-3
 // limit — every dead entry cost a wasted round trip per turn and the chain ran dry,
 // so the caller never heard a price. Default now lists only vendors measured to
 // answer (groq x3 models, mistral, zhipu); the dead ones stay opt-in via AI_LLM_CHAIN.
-const LLM_ORDER = parseOrder(process.env.AI_LLM_CHAIN, 'groq,mistral,zhipu')
+const LLM_ORDER = parseOrder(process.env.AI_LLM_CHAIN, 'groq,nvidia,mistral,zhipu')
 
 function llmChain() {
   const byVendor = {
@@ -770,11 +777,14 @@ function llmChain() {
       url: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
       key: ZHIPU_KEY, model: ZHIPU_MODEL,
     }] : [],
-    nvidia: () => NVIDIA_KEY ? [{
-      name: `nvidia:${NVIDIA_LLM_MODEL}`,
-      url: `${NVIDIA_URL}/chat/completions`,
-      key: NVIDIA_KEY, model: NVIDIA_LLM_MODEL,
-    }] : [],
+    nvidia: () => NVIDIA_KEY
+      ? [NVIDIA_LLM_MODEL, NVIDIA_LLM_FALLBACK].filter((m, i, a) => m && a.indexOf(m) === i).map(m => ({
+          name: `nvidia:${m}`,
+          url: `${NVIDIA_URL}/chat/completions`,
+          key: NVIDIA_KEY, model: m,
+          extraBody: { chat_template_kwargs: { enable_thinking: false } },
+        }))
+      : [],
   }
   return LLM_ORDER.flatMap(v => (byVendor[v] ? byVendor[v]() : []))
 }
@@ -833,6 +843,7 @@ async function streamOnce(ep, messages, onSentence, shouldStop, opts) {
       // into the 4-5 sentence answers heard on the test call.
       max_tokens: opts.maxTokens ?? 160,
       ...(ep.reasoningEffort ? { reasoning_effort: ep.reasoningEffort } : {}),
+      ...(ep.extraBody || {}),
       stream: true,
     }),
     signal: AbortSignal.timeout(opts.timeoutMs ?? 20000),
